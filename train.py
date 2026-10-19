@@ -235,10 +235,11 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
                 "format": result.format,
                 "parsed": result.parsed,
                 "truncated": choice.finish_reason == "length",
-                "answer": answer,
                 "completion_tokens": usage.completion_tokens if usage else 0,
             },
+            # metrics must be numeric (ART validates them), so the parsed answer string goes in metadata
             metadata={"task": puzzle.task, "puzzle_id": puzzle.meta["puzzle_id"], "answer": puzzle.answer,
+                      "predicted": answer,
                       "response": text, "reasoning": reasoning, "policy_step": policy["step"]},
         )
         return traj.finish()
