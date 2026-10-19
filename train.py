@@ -26,6 +26,7 @@ from typing import Any
 
 from serverless import config as C
 from serverless import tracing
+from serverless.dynamic import DynamicDifficulty
 from serverless.images import ImageSource
 from serverless.objective import PRESETS, Objective, puzzle_messages
 from serverless.rewards import Score
@@ -41,6 +42,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--tasks", default="ssl-r1", help=f"preset {sorted(PRESETS)} or 'task[:weight],...'")
     p.add_argument("--difficulty", choices=["paper", "easy"], default="paper")
     p.add_argument("--task-params", default=None, help='JSON overrides, e.g. \'{"rotation": {"steps": 8}}\'')
+    p.add_argument("--dynamic-difficulty", action="store_true",
+                   help="sample task t with p_t ∝ weight_t / acc_t (EMA of training accuracy); see serverless.dynamic")
+    p.add_argument("--dynamic-momentum", type=float, default=0.8, help="EMA weight on the previous accuracy estimate")
+    p.add_argument("--dynamic-min-accuracy", type=float, default=0.05, help="accuracy floor in the 1/acc weighting")
+    p.add_argument("--dynamic-init", type=Path, default=None,
+                   help="initial accuracies from a serverless.difficulty summary.json (default: 0.5 for every task)")
     p.add_argument("--steps", type=int, default=C.STEPS_MULTI_TASK)
     p.add_argument("--group-size", type=int, default=C.GROUP_SIZE, help="responses per prompt")
     p.add_argument("--groups-per-step", type=int, default=C.GROUPS_PER_STEP, help="prompts per step")
@@ -118,10 +125,22 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
         f.write(json.dumps(row, default=str) + "\n")
 
 
+def make_dynamic(args: argparse.Namespace, objective: Objective) -> DynamicDifficulty | None:
+    if not args.dynamic_difficulty:
+        return None
+    kwargs = dict(momentum=args.dynamic_momentum, min_accuracy=args.dynamic_min_accuracy)
+    if args.dynamic_init is not None:
+        return DynamicDifficulty.from_summary(objective.weights, args.dynamic_init, **kwargs)
+    return DynamicDifficulty(objective.weights, **kwargs)
+
+
 def dry_run(args: argparse.Namespace, objective: Objective, out_dir: Path) -> None:
     source = ImageSource(args.train_images)
+    dynamic = make_dynamic(args, objective)
+    if dynamic is not None:
+        print("dynamic difficulty: " + json.dumps(dynamic.state()))
     t0 = time.perf_counter()
-    puzzles = objective.batch(source, "train", 0, args.groups_per_step)
+    puzzles = objective.batch(source, "train", 0, args.groups_per_step, dynamic.weights() if dynamic else None)
     gen_s = time.perf_counter() - t0
     preview = out_dir / "dry_run"
     preview.mkdir(parents=True, exist_ok=True)
@@ -261,11 +280,19 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
 
     start = policy["step"]
     print(f"model {model.entity}/{model.project}/{args.name} at step {start}; training to {args.steps}")
+    dynamic = make_dynamic(args, objective)
+    dynamic_path = out_dir / "dynamic_difficulty.jsonl"
+    if dynamic is not None:
+        if not dynamic.load(dynamic_path, start):
+            dynamic.save(dynamic_path, start)
+        print("dynamic difficulty: " + json.dumps(dynamic.state()))
     if val_source is not None and start % args.val_every == 0:
         await evaluate(start)
     for step in range(start, args.steps):
         t0 = time.perf_counter()
-        puzzles = await asyncio.to_thread(objective.batch, train_source, "train", step, args.groups_per_step)
+        task_probs = dynamic.weights() if dynamic is not None else None
+        puzzles = await asyncio.to_thread(objective.batch, train_source, "train", step, args.groups_per_step,
+                                          task_probs)
         sinks: list[list[Score]] = [[] for _ in puzzles]
         groups = await art.gather_trajectory_groups(
             [make_group(p, s) for p, s in zip(puzzles, sinks)],
@@ -281,6 +308,10 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
         summary.update(rollout_seconds=rollout_s, train_seconds=time.perf_counter() - t0 - rollout_s,
                        request_retries=sum(retry_counts.values()))
         retry_counts.clear()
+        if dynamic is not None:
+            summary.update({f"{t}/task_prob": p for t, p in task_probs.items()})
+            dynamic.update(summary)
+            dynamic.save(dynamic_path, result.step)
         policy["step"] = result.step
         await model.log(groups, metrics=result.metrics, step=result.step, split="train")
         await model.log(metrics={f"puzzle_train/{k}": v for k, v in summary.items()}, step=result.step)

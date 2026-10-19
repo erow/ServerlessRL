@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from serverless.config import FORMAT_PROMPT, FORMAT_REWARD
+from serverless.dynamic import systematic_allocation
 from serverless.images import ImageSource, to_data_uri
 from serverless.rewards import REQUIRE_THINK, Score, score
 from serverless.tasks import EASY, TASKS, Puzzle, Task, build_task
@@ -101,17 +102,28 @@ class Objective:
             "format_requires_think": REQUIRE_THINK,
         }
 
-    def puzzle(self, source: ImageSource, split: str, step: int, slot: int, slots_per_step: int) -> Puzzle:
-        """Puzzle for a (split, step, slot) position; identical across restarts for the same seed."""
-        position = step * slots_per_step + slot
-        name = self.schedule[position % len(self.schedule)]
+    def puzzle(self, source: ImageSource, split: str, step: int, slot: int, slots_per_step: int,
+               name: str | None = None) -> Puzzle:
+        """Puzzle for a (split, step, slot) position; identical across restarts for the same seed.
+
+        `name` overrides the static schedule's task for this slot (dynamic difficulty)."""
+        if name is None:
+            position = step * slots_per_step + slot
+            name = self.schedule[position % len(self.schedule)]
         rng = random.Random(f"{self.seed}:{split}:{step}:{slot}")
         puzzle = self.tasks[name].generate(rng, source)
         puzzle.meta["puzzle_id"] = f"{split}-{step}-{slot}"
         return puzzle
 
-    def batch(self, source: ImageSource, split: str, step: int, size: int) -> list[Puzzle]:
-        return [self.puzzle(source, split, step, i, size) for i in range(size)]
+    def batch(self, source: ImageSource, split: str, step: int, size: int,
+              weights: dict[str, float] | None = None) -> list[Puzzle]:
+        """One step of puzzles; with `weights`, tasks are allocated by seeded systematic sampling instead of the
+        static schedule."""
+        if weights is None:
+            return [self.puzzle(source, split, step, i, size) for i in range(size)]
+        offset = random.Random(f"{self.seed}:{split}:{step}:tasks").random()
+        names = systematic_allocation(weights, size, offset)
+        return [self.puzzle(source, split, step, i, size, name) for i, name in enumerate(names)]
 
     def score(self, puzzle: Puzzle, response: str, reasoning: str | None = None) -> Score:
         """Score the final answer; `reasoning` is the native thinking channel when thinking mode is on."""
