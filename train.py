@@ -319,7 +319,10 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
         append_jsonl(out_dir / "train_metrics.jsonl", {"step": result.step, "data_step": step, **summary,
                                                         "artifact": getattr(result, "artifact_name", None)})
         print(f"step {result.step}: reward={summary.get('reward', 0):.3f} acc={summary.get('accuracy', 0):.3f} "
-              f"format={summary.get('format', 0):.3f} degenerate={summary['degenerate_group_frac']:.2f}")
+              f"format={summary.get('format', 0):.3f} degenerate={summary['degenerate_group_frac']:.2f} " +
+              " ".join(f"{t}/acc={summary[f'{t}/accuracy']:.3f}" +
+                       (f"(p={summary[f'{t}/task_prob']:.2f})" if f"{t}/task_prob" in summary else "")
+                       for t in objective.tasks if f"{t}/accuracy" in summary))
         if val_source is not None and result.step % args.val_every == 0:
             await evaluate(result.step)
     await backend.close()
