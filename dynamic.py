@@ -20,7 +20,7 @@ from typing import Any
 @dataclass
 class DynamicDifficulty:
     base_weights: dict[str, float]
-    momentum: float = 0.8  # EMA weight on the previous estimate
+    momentum: float = 0.95  # EMA weight on the previous estimate; ~20 steps of memory
     min_accuracy: float = 0.05
     accuracy: dict[str, float] = field(default_factory=dict)
 

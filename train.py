@@ -44,7 +44,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--task-params", default=None, help='JSON overrides, e.g. \'{"rotation": {"steps": 8}}\'')
     p.add_argument("--dynamic-difficulty", action="store_true",
                    help="sample task t with p_t ∝ weight_t / acc_t (EMA of training accuracy); see serverless.dynamic")
-    p.add_argument("--dynamic-momentum", type=float, default=0.8, help="EMA weight on the previous accuracy estimate")
+    p.add_argument("--dynamic-momentum", type=float, default=0.95,
+                   help="EMA weight on the previous accuracy estimate (~1/(1-m) steps of memory)")
     p.add_argument("--dynamic-min-accuracy", type=float, default=0.05, help="accuracy floor in the 1/acc weighting")
     p.add_argument("--dynamic-init", type=Path, default=None,
                    help="initial accuracies from a serverless.difficulty summary.json (default: 0.5 for every task)")
