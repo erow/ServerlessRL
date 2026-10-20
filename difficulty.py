@@ -45,6 +45,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=C.SEED)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=None)
+    p.add_argument("--top-k", type=int, default=None, help="sent in extra_body (vLLM/SGLang)")
     p.add_argument("--max-completion-tokens", type=int, default=C.MAX_COMPLETION_TOKENS)
     p.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=None,
                    help="send chat_template_kwargs.enable_thinking (vLLM/SGLang); omitted unless given")
@@ -77,6 +78,8 @@ async def complete(client: Any, args: argparse.Namespace, messages: list[dict]) 
     if args.top_p is not None:
         request["top_p"] = args.top_p
     extra = json.loads(args.extra_body) if args.extra_body else {}
+    if args.top_k is not None:
+        extra["top_k"] = args.top_k
     if args.enable_thinking is not None:
         extra.setdefault("chat_template_kwargs", {})["enable_thinking"] = args.enable_thinking
     if extra:

@@ -55,6 +55,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--learning-rate", type=float, default=C.LEARNING_RATE)
     p.add_argument("--kl-penalty", type=float, default=C.KL_PENALTY)
     p.add_argument("--temperature", type=float, default=C.TEMPERATURE)
+    p.add_argument("--top-p", type=float, default=C.TOP_P, help="nucleus sampling for training rollouts")
+    p.add_argument("--top-k", type=int, default=C.TOP_K, help="top-k sampling for training rollouts (vLLM extra_body)")
     p.add_argument("--max-completion-tokens", type=int, default=C.MAX_COMPLETION_TOKENS,
                    help="includes thinking tokens when --enable-thinking is on")
     p.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=C.ENABLE_THINKING,
@@ -191,6 +193,7 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
         for attempt in range(args.max_retries + 1):
             try:
                 async with semaphore:
+                    extra_body: dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": args.enable_thinking}}
                     request = dict(
                         model=model.get_inference_name(policy["step"]),
                         messages=messages,
@@ -198,8 +201,14 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
                         temperature=temperature,
                         logprobs=True,
                         timeout=args.request_timeout,
-                        extra_body={"chat_template_kwargs": {"enable_thinking": args.enable_thinking}},
+                        extra_body=extra_body,
                     )
+                    # Truncation only matters when sampling; greedy val requests (temperature 0) skip it.
+                    if temperature > 0:
+                        if args.top_p is not None:
+                            request["top_p"] = args.top_p
+                        if args.top_k is not None:
+                            extra_body["top_k"] = args.top_k
                     if not args.stream:
                         return await client.chat.completions.create(**request)
                     # The endpoint sits behind a proxy that drops non-streaming responses after 120 s (HTTP 524);
