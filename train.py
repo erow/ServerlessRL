@@ -26,6 +26,7 @@ from typing import Any
 
 from serverless import config as C
 from serverless import tracing
+from serverless.dynamic import DynamicDifficulty
 from serverless.images import ImageSource
 from serverless.objective import PRESETS, Objective, puzzle_messages
 from serverless.rewards import Score
@@ -41,12 +42,21 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--tasks", default="ssl-r1", help=f"preset {sorted(PRESETS)} or 'task[:weight],...'")
     p.add_argument("--difficulty", choices=["paper", "easy"], default="paper")
     p.add_argument("--task-params", default=None, help='JSON overrides, e.g. \'{"rotation": {"steps": 8}}\'')
+    p.add_argument("--dynamic-difficulty", action="store_true",
+                   help="sample task t with p_t ∝ weight_t / acc_t (EMA of training accuracy); see serverless.dynamic")
+    p.add_argument("--dynamic-momentum", type=float, default=0.95,
+                   help="EMA weight on the previous accuracy estimate (~1/(1-m) steps of memory)")
+    p.add_argument("--dynamic-min-accuracy", type=float, default=0.05, help="accuracy floor in the 1/acc weighting")
+    p.add_argument("--dynamic-init", type=Path, default=None,
+                   help="initial accuracies from a serverless.difficulty summary.json (default: 0.5 for every task)")
     p.add_argument("--steps", type=int, default=C.STEPS_MULTI_TASK)
     p.add_argument("--group-size", type=int, default=C.GROUP_SIZE, help="responses per prompt")
     p.add_argument("--groups-per-step", type=int, default=C.GROUPS_PER_STEP, help="prompts per step")
     p.add_argument("--learning-rate", type=float, default=C.LEARNING_RATE)
     p.add_argument("--kl-penalty", type=float, default=C.KL_PENALTY)
     p.add_argument("--temperature", type=float, default=C.TEMPERATURE)
+    p.add_argument("--top-p", type=float, default=C.TOP_P, help="nucleus sampling for training rollouts")
+    p.add_argument("--top-k", type=int, default=C.TOP_K, help="top-k sampling for training rollouts (vLLM extra_body)")
     p.add_argument("--max-completion-tokens", type=int, default=C.MAX_COMPLETION_TOKENS,
                    help="includes thinking tokens when --enable-thinking is on")
     p.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=C.ENABLE_THINKING,
@@ -118,10 +128,22 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
         f.write(json.dumps(row, default=str) + "\n")
 
 
+def make_dynamic(args: argparse.Namespace, objective: Objective) -> DynamicDifficulty | None:
+    if not args.dynamic_difficulty:
+        return None
+    kwargs = dict(momentum=args.dynamic_momentum, min_accuracy=args.dynamic_min_accuracy)
+    if args.dynamic_init is not None:
+        return DynamicDifficulty.from_summary(objective.weights, args.dynamic_init, **kwargs)
+    return DynamicDifficulty(objective.weights, **kwargs)
+
+
 def dry_run(args: argparse.Namespace, objective: Objective, out_dir: Path) -> None:
     source = ImageSource(args.train_images)
+    dynamic = make_dynamic(args, objective)
+    if dynamic is not None:
+        print("dynamic difficulty: " + json.dumps(dynamic.state()))
     t0 = time.perf_counter()
-    puzzles = objective.batch(source, "train", 0, args.groups_per_step)
+    puzzles = objective.batch(source, "train", 0, args.groups_per_step, dynamic.weights() if dynamic else None)
     gen_s = time.perf_counter() - t0
     preview = out_dir / "dry_run"
     preview.mkdir(parents=True, exist_ok=True)
@@ -171,6 +193,7 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
         for attempt in range(args.max_retries + 1):
             try:
                 async with semaphore:
+                    extra_body: dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": args.enable_thinking}}
                     request = dict(
                         model=model.get_inference_name(policy["step"]),
                         messages=messages,
@@ -178,8 +201,14 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
                         temperature=temperature,
                         logprobs=True,
                         timeout=args.request_timeout,
-                        extra_body={"chat_template_kwargs": {"enable_thinking": args.enable_thinking}},
+                        extra_body=extra_body,
                     )
+                    # Truncation only matters when sampling; greedy val requests (temperature 0) skip it.
+                    if temperature > 0:
+                        if args.top_p is not None:
+                            request["top_p"] = args.top_p
+                        if args.top_k is not None:
+                            extra_body["top_k"] = args.top_k
                     if not args.stream:
                         return await client.chat.completions.create(**request)
                     # The endpoint sits behind a proxy that drops non-streaming responses after 120 s (HTTP 524);
@@ -216,10 +245,11 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
                 "format": result.format,
                 "parsed": result.parsed,
                 "truncated": choice.finish_reason == "length",
-                "answer": answer,
                 "completion_tokens": usage.completion_tokens if usage else 0,
             },
+            # metrics must be numeric (ART validates them), so the parsed answer string goes in metadata
             metadata={"task": puzzle.task, "puzzle_id": puzzle.meta["puzzle_id"], "answer": puzzle.answer,
+                      "predicted": answer,
                       "response": text, "reasoning": reasoning, "policy_step": policy["step"]},
         )
         return traj.finish()
@@ -261,11 +291,19 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
 
     start = policy["step"]
     print(f"model {model.entity}/{model.project}/{args.name} at step {start}; training to {args.steps}")
+    dynamic = make_dynamic(args, objective)
+    dynamic_path = out_dir / "dynamic_difficulty.jsonl"
+    if dynamic is not None:
+        if not dynamic.load(dynamic_path, start):
+            dynamic.save(dynamic_path, start)
+        print("dynamic difficulty: " + json.dumps(dynamic.state()))
     if val_source is not None and start % args.val_every == 0:
         await evaluate(start)
     for step in range(start, args.steps):
         t0 = time.perf_counter()
-        puzzles = await asyncio.to_thread(objective.batch, train_source, "train", step, args.groups_per_step)
+        task_probs = dynamic.weights() if dynamic is not None else None
+        puzzles = await asyncio.to_thread(objective.batch, train_source, "train", step, args.groups_per_step,
+                                          task_probs)
         sinks: list[list[Score]] = [[] for _ in puzzles]
         groups = await art.gather_trajectory_groups(
             [make_group(p, s) for p, s in zip(puzzles, sinks)],
@@ -281,13 +319,20 @@ async def train(args: argparse.Namespace, objective: Objective, out_dir: Path) -
         summary.update(rollout_seconds=rollout_s, train_seconds=time.perf_counter() - t0 - rollout_s,
                        request_retries=sum(retry_counts.values()))
         retry_counts.clear()
+        if dynamic is not None:
+            summary.update({f"{t}/task_prob": p for t, p in task_probs.items()})
+            dynamic.update(summary)
+            dynamic.save(dynamic_path, result.step)
         policy["step"] = result.step
         await model.log(groups, metrics=result.metrics, step=result.step, split="train")
         await model.log(metrics={f"puzzle_train/{k}": v for k, v in summary.items()}, step=result.step)
         append_jsonl(out_dir / "train_metrics.jsonl", {"step": result.step, "data_step": step, **summary,
                                                         "artifact": getattr(result, "artifact_name", None)})
         print(f"step {result.step}: reward={summary.get('reward', 0):.3f} acc={summary.get('accuracy', 0):.3f} "
-              f"format={summary.get('format', 0):.3f} degenerate={summary['degenerate_group_frac']:.2f}")
+              f"format={summary.get('format', 0):.3f} degenerate={summary['degenerate_group_frac']:.2f} " +
+              " ".join(f"{t}/acc={summary[f'{t}/accuracy']:.3f}" +
+                       (f"(p={summary[f'{t}/task_prob']:.2f})" if f"{t}/task_prob" in summary else "")
+                       for t in objective.tasks if f"{t}/accuracy" in summary))
         if val_source is not None and result.step % args.val_every == 0:
             await evaluate(result.step)
     await backend.close()

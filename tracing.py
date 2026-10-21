@@ -45,6 +45,8 @@ def _inputs(inputs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _output(traj: Any) -> dict[str, Any]:
+    if traj is None:  # the rollout raised; weave still post-processes the (missing) output
+        return {}
     return {"reasoning": traj.metadata.get("reasoning"), "response": traj.metadata.get("response"),
             "reward": traj.reward, "policy_step": traj.metadata.get("policy_step"), **traj.metrics}
 

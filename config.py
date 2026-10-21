@@ -27,6 +27,9 @@ LEARNING_RATE = 1e-6
 STEPS_MULTI_TASK = 2000
 STEPS_SINGLE_TASK = 1000
 TEMPERATURE = 1.0
+# Gemma 4's recommended sampling; not in the paper. Set to None to sample from the full distribution.
+TOP_P = 0.95
+TOP_K = 64
 KL_PENALTY = 0.0  # KL and entropy terms removed (SSL-R1 follows Visual Jigsaw)
 MAX_COMPLETION_TOKENS = 2048  # not reported in the paper
 SEED = 0
