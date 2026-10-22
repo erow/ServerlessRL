@@ -74,6 +74,37 @@ Every task shares one reward definition. Prompts are assigned to tasks by a dete
 each step stays close to the target proportions. To add a task, implement `generate(rng, source) -> Puzzle` with
 `kind` set to `choice`, `integer`, or `sequence`, then register it in `tasks/__init__.py`.
 
+## Masked-view caption game (experimental)
+
+`caption_game.py` is a label-free self-play objective, separate from the SSL-R1 puzzles. For each image the same
+policy plays three roles:
+
+| Role | Sees | Reward |
+| --- | --- | --- |
+| Captioner | The full image | Share of judge samples that picked its caption as the real one |
+| Forger | The image with a salient region greyed out; told to describe the whole scene | Share of judge samples it fooled; 0 if it mentions the mask, hedges, or its length is outside 0.8–1.25× the paired real caption |
+| Judge | The full image and one (real, forged) pair in random order | 1 for naming the full-image caption, plus the 0.2 format bonus |
+
+The label comes from which view wrote the caption, so no annotation is used. The masked region is the
+highest-edge-energy box among 8 random candidates. Its size starts at `--mask-ratio` and is steered so judge
+accuracy stays near `--judge-target` (turn off with `--fixed-mask`). Near-identical pairs (word Jaccard above
+0.9) are not judged. Each image gives one captioner group and one forger group of `--caption-samples`, and one judge
+group of `--judge-samples` per judged pair.
+
+```bash
+SERVERLESS_ENTRY=serverless.caption_game sbatch serverless/submit.sh --name capgame-smoke --dry-run
+# Pilot 1: judge only, captions from the frozen base checkpoint
+SERVERLESS_ENTRY=serverless.caption_game sbatch serverless/submit.sh --name capgame-judge \
+    --train-roles judge --freeze-captions --steps 200 --val-every 20
+# Pilot 2: full three-role game
+SERVERLESS_ENTRY=serverless.caption_game sbatch serverless/submit.sh --name capgame-full --steps 500 --val-every 20
+```
+
+Outputs mirror the puzzle runs: `train_metrics.jsonl` (judge accuracy, `judge/picked_a` position bias, forger gate
+pass and leak rates, caption lengths, mask ratio, zero-variance group share), `val_metrics.jsonl` and
+`val_games_stepNNNNN.jsonl` (greedy captions, forgeries and judgements on fixed val2017 images at the initial mask
+ratio), and `mask_ratio.jsonl` for resume. Downstream checks (POPE, AMBER, MMVP, CHAIR) are not wired in here.
+
 ## Setup
 
 1. Create a CoreWeave Forge API key. Export it as `WANDB_API_KEY` and keep it out of the repository.
