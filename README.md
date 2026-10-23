@@ -82,7 +82,7 @@ policy plays three roles:
 | Role | Sees | Reward |
 | --- | --- | --- |
 | Captioner | The full image | Share of judge samples that picked its caption as the real one |
-| Forger | The image with a salient region greyed out; told to describe the whole scene | Share of judge samples it fooled; 0 if it mentions the mask, hedges, or its length is outside 0.8–1.25× the paired real caption |
+| Forger | The image with a salient region greyed out; told to describe the whole scene | Share of judge samples it fooled; 0 if it mentions the mask, hedges, or its length is outside 0.6–1.6× the paired real caption or the captioner's word window |
 | Judge | The full image and one (real, forged) pair in random order | 1 for naming the full-image caption, plus the 0.2 format bonus |
 
 The label comes from which view wrote the caption, so no annotation is used. The masked region is the

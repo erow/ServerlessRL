@@ -130,8 +130,8 @@ def clean_caption(text: str) -> str:
 
 @dataclass
 class ForgeGate:
-    min_len_ratio: float = 0.8
-    max_len_ratio: float = 1.25
+    min_len_ratio: float = 0.6
+    max_len_ratio: float = 1.6
 
     def check(self, forged: str, real: str) -> tuple[bool, str]:
         if LEAK_PATTERNS.search(forged):
@@ -237,6 +237,9 @@ async def play(
     gate_reasons: Counter[str] = Counter()
     for i, (real, fake) in enumerate(zip(captions, forgeries)):
         passed, reason = cfg.gate.check(fake.text, real.text)
+        n_fake = len(words(fake.text))
+        if passed and not cfg.words_lo * cfg.caption_slack_lo <= n_fake <= cfg.words_hi * cfg.caption_slack_hi:
+            passed, reason = False, "length"  # same absolute window as the captioner
         gate_reasons[reason] += 1
         fake.metrics["gate_passed"] = float(passed)
         fake.metadata["gate"] = reason
@@ -365,8 +368,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--judge-target", type=float, default=0.7, help="judge accuracy the mask controller aims for")
     p.add_argument("--words-lo", type=int, default=50)
     p.add_argument("--words-hi", type=int, default=90)
-    p.add_argument("--min-len-ratio", type=float, default=0.8)
-    p.add_argument("--max-len-ratio", type=float, default=1.25)
+    p.add_argument("--min-len-ratio", type=float, default=0.6)
+    p.add_argument("--max-len-ratio", type=float, default=1.6)
     p.add_argument("--max-pair-overlap", type=float, default=0.9)
     p.add_argument("--learning-rate", type=float, default=C.LEARNING_RATE)
     p.add_argument("--kl-penalty", type=float, default=C.KL_PENALTY)
