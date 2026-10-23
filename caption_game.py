@@ -281,7 +281,10 @@ async def play(
     for k, (i, _, _) in enumerate(judge_jobs):
         group = list(judged[k * cfg.judge_samples:(k + 1) * cfg.judge_samples])
         judge_groups.append(group)
-        p_real = statistics.fmean(r.metrics["accuracy"] for r in group)
+        # Only parsed verdicts count: an unparseable judge answer is not a fooled judge, and counting it would
+        # pay the forger for captions that break the judge's output format.
+        verdicts = [r.metrics["accuracy"] for r in group if r.metrics["parsed"]]
+        p_real = statistics.fmean(verdicts) if verdicts else 0.5
         captions[i].reward = p_real
         forgeries[i].reward = (1.0 - p_real) if forgeries[i].metrics["gate_passed"] else 0.0
         captions[i].metadata["judged"] = forgeries[i].metadata["judged"] = True
@@ -291,6 +294,7 @@ async def play(
     stats = {
         "judge/accuracy": statistics.fmean(r.metrics["accuracy"] for r in all_judges) if all_judges else float("nan"),
         "judge/picked_a": statistics.fmean(r.metrics["picked_a"] for r in all_judges) if all_judges else float("nan"),
+        "judge/parsed": statistics.fmean(r.metrics["parsed"] for r in all_judges) if all_judges else float("nan"),
         "judge/format": statistics.fmean(r.metrics["format"] for r in all_judges) if all_judges else float("nan"),
         "judged_pair_frac": len(judge_jobs) / max(1, g),
         "forger/gate_pass": gate_reasons["ok"] / max(1, g),
