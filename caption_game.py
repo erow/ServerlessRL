@@ -253,6 +253,8 @@ async def play(
         # one outside the requested word range scores 0 and its pair is not judged.
         n_real = len(words(real.text))
         real_ok = cfg.words_lo * cfg.caption_slack_lo <= n_real <= cfg.words_hi * cfg.caption_slack_hi
+        # Forgeries may not hedge, so a hedging real caption would be an easy style tell; gate it the same way.
+        real_ok = real_ok and not LEAK_PATTERNS.search(real.text)
         real.metrics["length_ok"] = float(real_ok)
         if not real_ok:
             real.reward, fake.reward = 0.0, (0.5 if passed else 0.0)
