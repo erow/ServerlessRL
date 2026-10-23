@@ -68,14 +68,16 @@ JUDGE_PROMPT = (
     "guess what was there. Which caption was written by the person who saw the full image?\n\n"
     "Caption A: {a}\n\nCaption B: {b}\n\n"
     "Compare each caption with the image and look for details that are wrong or invented. "
-    "The final answer should be a single letter, A or B."
+    "Keep your reasoning to a few sentences. The final answer should be a single letter, A or B."
 )
 
 # Words that give a forged caption away by style rather than content.
 LEAK_PATTERNS = re.compile(
-    r"\b(possibly|probably|likely|perhaps|might|maybe|may be|appears? to|seems?|unclear|presumably|"
-    r"hidden|masked?|grey box|gray box|grey rectangle|gray rectangle|covered|obscured|blocked|occluded|"
-    r"can(?:not|'t) (?:see|tell)|not visible|missing)\b",
+    r"\b(possibly|probably|likely|perhaps|maybe|might|appears? to|seems?|unclear|presumably|"
+    r"(?:grey|gray) (?:box|rectangle|square|block|area|region|patch|overlay)|"
+    r"hidden (?:area|region|part|portion|section)|masked (?:area|region|part|portion)|"
+    r"(?:obscur|block|cover|occlud|hid)(?:ed|ing|es|s)? by (?:a|an|the) (?:grey|gray|large|solid|uniform|blank)|"
+    r"can(?:not|'t) (?:see|tell)|not visible)\b",
     re.IGNORECASE,
 )
 WORD = re.compile(r"[a-z0-9']+")
@@ -297,6 +299,8 @@ async def play(
     stats = {
         "judge/accuracy": statistics.fmean(r.metrics["accuracy"] for r in all_judges) if all_judges else float("nan"),
         "judge/picked_a": statistics.fmean(r.metrics["picked_a"] for r in all_judges) if all_judges else float("nan"),
+        "judge/accuracy_parsed": (statistics.fmean(r.metrics["accuracy"] for r in all_judges if r.metrics["parsed"])
+                                  if any(r.metrics["parsed"] for r in all_judges) else float("nan")),
         "judge/parsed": statistics.fmean(r.metrics["parsed"] for r in all_judges) if all_judges else float("nan"),
         "judge/format": statistics.fmean(r.metrics["format"] for r in all_judges) if all_judges else float("nan"),
         "judged_pair_frac": len(judge_jobs) / max(1, g),
@@ -377,6 +381,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--top-p", type=float, default=C.TOP_P)
     p.add_argument("--top-k", type=int, default=C.TOP_K)
     p.add_argument("--max-completion-tokens", type=int, default=C.MAX_COMPLETION_TOKENS)
+    p.add_argument("--judge-max-tokens", type=int, default=768,
+                   help="judge completion cap; a truncated judgement has no answer and scores 0")
     p.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=C.ENABLE_THINKING)
     p.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=C.SEED)
@@ -502,7 +508,8 @@ async def train(args: argparse.Namespace, out_dir: Path) -> None:
                 async with semaphore:
                     extra_body: dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": args.enable_thinking}}
                     request = dict(model=model.get_inference_name(step), messages=messages,
-                                   max_completion_tokens=args.max_completion_tokens, temperature=temperature,
+                                   max_completion_tokens=(args.judge_max_tokens if role == "judge" else args.max_completion_tokens),
+                                   temperature=temperature,
                                    logprobs=True, timeout=args.request_timeout, extra_body=extra_body)
                     if temperature > 0:
                         if args.top_p is not None:
@@ -577,7 +584,7 @@ async def train(args: argparse.Namespace, out_dir: Path) -> None:
                        degenerate_group_frac=statistics.fmean(
                            len({t.reward for t in g.trajectories}) <= 1 for g in groups) if groups else 1.0)
         retries.clear()
-        controller.update(summary.get("judge/accuracy", float("nan")))
+        controller.update(summary.get("judge/accuracy_parsed", float("nan")))  # unparsed answers are not "fooled"
         controller.save(controller_path, result.step)
         policy["step"] = result.step
         await model.log(groups, metrics=result.metrics, step=result.step, split="train")
