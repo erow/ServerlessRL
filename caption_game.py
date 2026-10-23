@@ -204,6 +204,8 @@ class GameConfig:
     mask_candidates: int = 8
     min_side: int = 28
     max_pair_overlap: float = 0.9
+    caption_slack_lo: float = 0.75   # captioner length window: [words_lo * lo, words_hi * hi]
+    caption_slack_hi: float = 1.25
     format_reward: float = C.FORMAT_REWARD
     thinking: bool = C.ENABLE_THINKING
     gate: ForgeGate = field(default_factory=ForgeGate)
@@ -242,6 +244,15 @@ async def play(
         for r in (real, fake):
             r.metrics["pair_overlap"] = overlap
             r.metrics["words"] = float(len(words(r.text)))
+        # Longer captions are easier to pick as real, so an unbounded captioner drifts to very long captions;
+        # one outside the requested word range scores 0 and its pair is not judged.
+        n_real = len(words(real.text))
+        real_ok = cfg.words_lo * cfg.caption_slack_lo <= n_real <= cfg.words_hi * cfg.caption_slack_hi
+        real.metrics["length_ok"] = float(real_ok)
+        if not real_ok:
+            real.reward, fake.reward = 0.0, (0.5 if passed else 0.0)
+            real.metadata["judged"] = fake.metadata["judged"] = False
+            continue
         if overlap > cfg.max_pair_overlap or not real.text or not fake.text:
             real.reward = fake.reward = 0.5 if passed else 0.0
             real.metadata["judged"] = fake.metadata["judged"] = False
@@ -287,6 +298,7 @@ async def play(
         "forger/gate_length": gate_reasons["length"] / max(1, g),
         "captioner/reward": statistics.fmean(r.reward for r in captions),
         "forger/reward": statistics.fmean(r.reward for r in forgeries),
+        "captioner/length_ok": statistics.fmean(r.metrics["length_ok"] for r in captions),
         "captioner/words": statistics.fmean(len(words(r.text)) for r in captions),
         "forger/words": statistics.fmean(len(words(r.text)) for r in forgeries),
         "pair_overlap": statistics.fmean(r.metrics["pair_overlap"] for r in captions),
