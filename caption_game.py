@@ -39,6 +39,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 import numpy as np
@@ -545,6 +546,28 @@ async def train(args: argparse.Namespace, out_dir: Path) -> None:
             raise RuntimeError(f"{len(failed)}/{len(outcomes)} games failed") from failed[0]
         return [o for o in outcomes if not isinstance(o, BaseException)]
 
+    async def train_with_retry(groups: list[Any]) -> Any:
+        """backend.train with backoff on 5xx/timeouts (e.g. a 524 from the proxy while the service is slow).
+
+        A failed call may still have trained server-side, so before retrying we check whether the checkpoint
+        advanced; if it did, that step is kept instead of training the same groups twice."""
+        before = policy["step"]
+        for attempt in range(args.max_retries + 1):
+            try:
+                return await backend.train(model, groups, learning_rate=args.learning_rate, loss_fn="ppo",
+                                           kl_penalty_coef=args.kl_penalty, scale_rewards=True)
+            except (openai.InternalServerError, openai.APITimeoutError, openai.APIConnectionError) as exc:
+                if attempt == args.max_retries:
+                    raise
+                retries[f"train_{type(exc).__name__}"] += 1
+                print(f"backend.train failed ({type(exc).__name__}); retry {attempt + 1}", file=sys.stderr)
+                await asyncio.sleep(min(300.0, 30.0 * 2 ** attempt))
+                step = await model.get_step()
+                if step > before:
+                    print(f"checkpoint advanced to step {step} despite the error; keeping it", file=sys.stderr)
+                    return SimpleNamespace(step=step, metrics={})
+        raise AssertionError("unreachable")
+
     controller = MaskController(ratio=args.mask_ratio, target=args.judge_target, enabled=not args.fixed_mask)
     controller_path = out_dir / "mask_ratio.jsonl"
     start = policy["step"]
@@ -578,8 +601,7 @@ async def train(args: argparse.Namespace, out_dir: Path) -> None:
         results = await play_all(images, controller.ratio)
         groups = build_groups(art, results, roles, policy["step"])
         rollout_s = time.perf_counter() - t0
-        result = await backend.train(model, groups, learning_rate=args.learning_rate, loss_fn="ppo",
-                                     kl_penalty_coef=args.kl_penalty, scale_rewards=True)
+        result = await train_with_retry(groups)
         summary = mean_stats(results)
         summary.update(mask_ratio=controller.ratio, n_groups=len(groups), rollout_seconds=rollout_s,
                        train_seconds=time.perf_counter() - t0 - rollout_s, request_retries=sum(retries.values()),
