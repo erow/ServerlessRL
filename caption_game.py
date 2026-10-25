@@ -149,8 +149,19 @@ class ForgeGate:
 
 
 def parse_judgement(text: str) -> str | None:
+    """The judge's letter: last \\boxed{}, else a closing "Final answer: X" or a bare letter on the last line.
+
+    The format bonus still requires \\boxed{}; this only decides whether the verdict counts."""
     boxes = boxed_contents(text)
-    content = boxes[-1] if boxes else text.strip().splitlines()[-1] if text.strip() else ""
+    if boxes:
+        content = boxes[-1]
+    else:
+        tail = text.strip().splitlines()[-1] if text.strip() else ""
+        m = re.search(r"final answer\s*(?:is)?\s*[:\-]?\s*\**\s*\(?\s*(?:caption\s+)?([AB])\b\s*\)?\**\s*\.?\s*$",
+                      tail, re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
+        content = tail
     m = re.fullmatch(r"\s*\(?\s*(?:caption\s+)?([AB])\s*\)?\s*\.?\s*", content, re.IGNORECASE)
     return m.group(1).upper() if m else None
 
