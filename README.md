@@ -82,14 +82,15 @@ policy plays three roles:
 | Role | Sees | Reward |
 | --- | --- | --- |
 | Captioner | The full image | Share of judge samples that picked its caption as the real one; 0 if it hedges or falls outside the word window |
-| Forger | The image with a salient region greyed out; told to describe the whole scene | Mean of two terms: how far it fooled the judge (1 − the judge's probability on the right letter) and content-word F1 against the image's full-image captions; 0 if it mentions the mask, hedges, or its length is outside 0.6–1.6× the paired real caption or the captioner's word window |
+| Forger | The image with a salient region greyed out; told to describe the whole scene | Mean of two terms: the share of judge samples it fooled, and content-word recall against the image's full-image captions (`--content-metric f1` also pays precision); −0.5 (`--gate-penalty`) if it mentions the mask, hedges, or is outside the captioner's word window; 0 if only its length is outside 0.6–1.6× the paired real caption |
 | Judge | The full image and one (real, forged) pair in random order | 1 for naming the full-image caption, plus the 0.2 format bonus |
 
 The label comes from which view wrote the caption, so no annotation is used. The masked region is the
 highest-edge-energy box among 8 random candidates, covering `--mask-ratio` of the image (default 0.5, fixed;
 `--no-fixed-mask` steers it so judge accuracy stays near `--judge-target`). With a mask this large the judge catches
 nearly every forgery, so the forger's content term (`--forger-content-weight`, default 0.5) is what ranks forgeries
-within a group: it rewards guessing the hidden part right and punishes invented details. Near-identical pairs (word Jaccard above
+within a group: it rewards covering more of what the full-image captions say, hidden part included.
+Recall is the default because F1's precision term paid the forger for writing less (seen in run v3). Near-identical pairs (word Jaccard above
 0.9) are not judged. Each image gives one captioner group and one forger group of `--caption-samples`, and one judge
 group of `--judge-samples` per judged pair.
 
@@ -98,6 +99,9 @@ SERVERLESS_ENTRY=serverless.caption_game sbatch serverless/submit.sh --name capg
 # Pilot 1: judge only, captions from the frozen base checkpoint
 SERVERLESS_ENTRY=serverless.caption_game sbatch serverless/submit.sh --name capgame-judge \
     --train-roles judge --freeze-captions --steps 200 --val-every 20
+# Forger only, against the base-checkpoint captioner and judge
+SERVERLESS_ENTRY=serverless.caption_game sbatch serverless/submit.sh --name capgame-forger \
+    --train-roles forger --frozen-roles untrained --steps 100 --val-every 10
 # Pilot 2: full three-role game
 SERVERLESS_ENTRY=serverless.caption_game sbatch serverless/submit.sh --name capgame-full --steps 500 --val-every 20
 ```

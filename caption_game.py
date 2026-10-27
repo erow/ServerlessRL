@@ -17,9 +17,12 @@ natural hallucinations (guesses from context). Rewards, per GRPO group:
   outside [min_len_ratio, max_len_ratio] of the paired real caption (style shortcuts the judge could exploit):
   - fool: how far it fooled the judge, 1 - P(judge picks the real caption), using the probability of the judge's
     answer letter so a forgery that makes the judge hesitate scores above one it catches with certainty;
-  - content: content-word F1 against the full-image captions of the same image, i.e. how much of the true scene,
-    hidden part included, the forgery got right. With a large mask the judge catches almost every forgery, so
-    this term is what still separates good guesses from bad ones within a group.
+  - content: content-word recall against the full-image captions of the same image, i.e. how much of the true
+    scene, hidden part included, the forgery covered (--content-metric f1 also pays precision, which rewards
+    writing less). With a large mask the judge catches almost every forgery, so this term is what still
+    separates good guesses from bad ones within a group.
+  A forgery that describes the mask, hedges, or is too short or long scores --gate-penalty (-0.5), below any
+  honest attempt; one rejected only for its length ratio to the paired real caption scores 0.
 
 Pairs whose two captions are near-identical (word-set Jaccard above --max-pair-overlap) carry no signal: they are
 not judged, and both captions get the neutral reward 0.5.
@@ -150,6 +153,15 @@ def content_f1(candidate: str, reference: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def content_recall(candidate: str, reference: str) -> float:
+    """Share of the reference's content words the candidate also uses. Unlike F1 it never pays for writing less."""
+    c, r = content_words(candidate), content_words(reference)
+    return len(c & r) / len(r) if r else 0.0
+
+
+CONTENT_METRICS = {"recall": content_recall, "f1": content_f1}
+
+
 def letter_prob(completion: Any, letter: str) -> float | None:
     """Probability the judge gave its answer letter (the last token that is exactly that letter), if logged."""
     lp = getattr(completion.choices[0], "logprobs", None)
@@ -262,7 +274,11 @@ class GameConfig:
     format_reward: float = C.FORMAT_REWARD
     forger_fool_weight: float = 0.5     # forger reward = weighted mean of fooling the judge and content F1
     forger_content_weight: float = 0.5
-    soft_judge: bool = True             # fooling uses the judge's letter probability, not just its verdict
+    soft_judge: bool = False            # fooling uses the judge's letter probability, not just its verdict
+    content_metric: str = "recall"      # "recall" or "f1" against the full-image captions
+    # Reward for a forgery that describes the mask, hedges, or falls outside the absolute word window. Below a weak
+    # honest guess, so giving up on the hidden part is never as good as trying.
+    gate_penalty: float = -0.5
     thinking: bool = C.ENABLE_THINKING
     gate: ForgeGate = field(default_factory=ForgeGate)
 
@@ -294,8 +310,11 @@ async def play(
     for i, (real, fake) in enumerate(zip(captions, forgeries)):
         passed, reason = cfg.gate.check(fake.text, real.text)
         n_fake = len(words(fake.text))
-        if passed and not cfg.words_lo * cfg.caption_slack_lo <= n_fake <= cfg.words_hi * cfg.caption_slack_hi:
-            passed, reason = False, "length"  # same absolute window as the captioner
+        # Same absolute window as the captioner; checked before the ratio so a too-short forgery is penalised.
+        if reason in ("ok", "length") and n_fake < cfg.words_lo * cfg.caption_slack_lo:
+            passed, reason = False, "short"
+        elif reason in ("ok", "length") and n_fake > cfg.words_hi * cfg.caption_slack_hi:
+            passed, reason = False, "long"
         gate_reasons[reason] += 1
         fake.metrics["gate_passed"] = float(passed)
         fake.metadata["gate"] = reason
@@ -362,14 +381,20 @@ async def play(
     # every usable real caption of this image, so one vague or wrong real caption does not decide the score.
     refs = [c.text for c in captions if c.metrics.get("length_ok")]
     wf, wc = cfg.forger_fool_weight, cfg.forger_content_weight
+    metric = CONTENT_METRICS[cfg.content_metric]
     for fake in forgeries:
         fool = fake.metrics.setdefault("fool", 0.5)  # unjudged pairs are neutral
         if refs:
+            fake.metrics["content"] = statistics.fmean(metric(fake.text, ref) for ref in refs)
             fake.metrics["content_f1"] = statistics.fmean(content_f1(fake.text, ref) for ref in refs)
-            score = (wf * fool + wc * fake.metrics["content_f1"]) / (wf + wc) if wf + wc > 0 else fool
+            score = (wf * fool + wc * fake.metrics["content"]) / (wf + wc) if wf + wc > 0 else fool
         else:
             score = fool
-        fake.reward = score if fake.metrics["gate_passed"] else 0.0
+        if fake.metrics["gate_passed"]:
+            fake.reward = score
+        else:
+            # Ratio mismatches depend on the paired real caption, so they are not the forger's fault: 0, not penalty.
+            fake.reward = 0.0 if fake.metadata["gate"] == "length" else cfg.gate_penalty
 
     all_judges = [r for grp in judge_groups for r in grp]
     stats = {
@@ -381,6 +406,8 @@ async def play(
         "judge/soft_accuracy": (statistics.fmean(r.metrics["soft_accuracy"] for r in all_judges if r.metrics["parsed"])
                                 if any(r.metrics["parsed"] for r in all_judges) else float("nan")),
         "forger/fool": statistics.fmean(r.metrics["fool"] for r in forgeries),
+        "forger/content": (statistics.fmean(r.metrics["content"] for r in forgeries if "content" in r.metrics)
+                           if any("content" in r.metrics for r in forgeries) else float("nan")),
         "forger/content_f1": (statistics.fmean(r.metrics["content_f1"] for r in forgeries if "content_f1" in r.metrics)
                               if any("content_f1" in r.metrics for r in forgeries) else float("nan")),
         "captioner/content_f1": (statistics.fmean(content_f1(a.text, b.text) for a in captions for b in captions
@@ -390,6 +417,8 @@ async def play(
         "forger/gate_pass": gate_reasons["ok"] / max(1, g),
         "forger/gate_leak": gate_reasons["leak"] / max(1, g),
         "forger/gate_length": gate_reasons["length"] / max(1, g),
+        "forger/gate_short": gate_reasons["short"] / max(1, g),
+        "forger/gate_long": gate_reasons["long"] / max(1, g),
         "captioner/reward": statistics.fmean(r.reward for r in captions),
         "forger/reward": statistics.fmean(r.reward for r in forgeries),
         "captioner/length_ok": statistics.fmean(r.metrics["length_ok"] for r in captions),
@@ -450,13 +479,20 @@ def parser() -> argparse.ArgumentParser:
                    help="roles whose trajectories are trained; e.g. 'judge' for the judge-only pilot")
     p.add_argument("--freeze-captions", action="store_true",
                    help="captions and forgeries always come from the base checkpoint (step 0), not the policy")
+    p.add_argument("--frozen-roles", default="",
+                   help="roles that always sample from the base checkpoint, e.g. 'captioner,judge' for a forger-only "
+                        "run against fixed opponents; 'untrained' freezes every role not in --train-roles")
     p.add_argument("--mask-ratio", type=float, default=0.5, help="masked fraction of the image (initial, if steered)")
     p.add_argument("--fixed-mask", action=argparse.BooleanOptionalAction, default=True,
                    help="keep --mask-ratio; --no-fixed-mask steers it toward --judge-target")
     p.add_argument("--forger-fool-weight", type=float, default=0.5, help="forger reward weight on fooling the judge")
     p.add_argument("--forger-content-weight", type=float, default=0.5,
-                   help="forger reward weight on content-word F1 against the full-image captions")
-    p.add_argument("--soft-judge", action=argparse.BooleanOptionalAction, default=True,
+                   help="forger reward weight on content overlap with the full-image captions")
+    p.add_argument("--content-metric", choices=sorted(CONTENT_METRICS), default="recall",
+                   help="recall: share of the real captions' content words the forgery covers; f1 also pays precision")
+    p.add_argument("--gate-penalty", type=float, default=-0.5,
+                   help="forger reward when it describes the mask, hedges, or is too short or long")
+    p.add_argument("--soft-judge", action=argparse.BooleanOptionalAction, default=False,
                    help="score fooling with the judge's answer-letter probability instead of its hard verdict")
     p.add_argument("--judge-target", type=float, default=0.7, help="judge accuracy the mask controller aims for")
     p.add_argument("--words-lo", type=int, default=50)
@@ -493,8 +529,19 @@ def game_config(args: argparse.Namespace) -> GameConfig:
         words_lo=args.words_lo, words_hi=args.words_hi, max_pair_overlap=args.max_pair_overlap,
         thinking=args.enable_thinking, gate=ForgeGate(args.min_len_ratio, args.max_len_ratio),
         forger_fool_weight=args.forger_fool_weight, forger_content_weight=args.forger_content_weight,
-        soft_judge=args.soft_judge,
+        soft_judge=args.soft_judge, content_metric=args.content_metric, gate_penalty=args.gate_penalty,
     )
+
+
+def frozen_roles(args: argparse.Namespace, roles: set[str]) -> set[str]:
+    """Roles that sample from the base checkpoint instead of the current policy."""
+    names = {r.strip() for r in args.frozen_roles.split(",") if r.strip()}
+    frozen = (set(ROLES) - roles) if names == {"untrained"} else names
+    if args.freeze_captions:
+        frozen |= {"captioner", "forger"}
+    if not frozen <= set(ROLES):
+        raise SystemExit(f"--frozen-roles must be a subset of {ROLES} or 'untrained'")
+    return frozen
 
 
 def step_images(source: ImageSource, seed: int, split: str, step: int, n: int) -> list[tuple[str, Image.Image, random.Random]]:
@@ -577,6 +624,10 @@ async def train(args: argparse.Namespace, out_dir: Path) -> None:
     roles = {r.strip() for r in args.train_roles.split(",") if r.strip()}
     if not roles <= set(ROLES):
         raise SystemExit(f"--train-roles must be a subset of {ROLES}")
+    frozen = frozen_roles(args, roles)
+    if frozen & roles:
+        print(f"warning: training roles {sorted(frozen & roles)} but sampling them from the base checkpoint",
+              file=sys.stderr)
     cfg = game_config(args)
     train_source = ImageSource(args.train_images)
     val_source = ImageSource(args.val_images) if args.val_every > 0 else None
@@ -593,7 +644,7 @@ async def train(args: argparse.Namespace, out_dir: Path) -> None:
                                                     "name": args.name, "base_model": args.base_model}, indent=2))
 
     async def complete(messages: list[dict], temperature: float, role: str) -> Any:
-        step = base_step if (args.freeze_captions and role != "judge") else policy["step"]
+        step = base_step if role in frozen else policy["step"]
         for attempt in range(args.max_retries + 1):
             try:
                 async with semaphore:
