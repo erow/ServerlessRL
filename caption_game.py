@@ -371,9 +371,13 @@ async def play(
         # pay the forger for captions that break the judge's output format.
         verdicts = [r.metrics["accuracy"] for r in group if r.metrics["parsed"]]
         p_real = statistics.fmean(verdicts) if verdicts else 0.5
-        soft = [r.metrics["soft_accuracy"] for r in group if r.metrics["parsed"]]
         captions[i].reward = p_real
-        forgeries[i].metrics["fool"] = 1.0 - (statistics.fmean(soft) if soft else 0.5)
+        # The forger only fools the judge with a parsed wrong verdict. An unparsed judge answer counts as a judge
+        # win for the forger: otherwise a forgery that makes the judge ramble or loop scores the neutral 0.5,
+        # ten times what an honest forgery earns against a strong judge (seen in run v4).
+        forgeries[i].metrics["fool"] = statistics.fmean(
+            (1.0 - r.metrics["soft_accuracy"]) if r.metrics["parsed"] else 0.0 for r in group)
+        forgeries[i].metrics["judge_parsed"] = statistics.fmean(r.metrics["parsed"] for r in group)
         captions[i].metadata["judged"] = forgeries[i].metadata["judged"] = True
         captions[i].metrics["judged_real"] = forgeries[i].metrics["judged_real"] = p_real
 
