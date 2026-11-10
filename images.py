@@ -33,6 +33,12 @@ class ImageSource:
             raise FileNotFoundError(f"no JPEG images under {self.root}")
         self.names = sorted(names)
 
+    def index_of(self, name: str) -> int | None:
+        """Index of an image by file name (any directory prefix, as inside a ZIP, is ignored)."""
+        if not hasattr(self, "_by_base"):
+            self._by_base = {n.rsplit("/", 1)[-1]: i for i, n in enumerate(self.names)}
+        return self._by_base.get(name.rsplit("/", 1)[-1])
+
     def __len__(self) -> int:
         return len(self.names)
 

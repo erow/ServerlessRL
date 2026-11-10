@@ -149,3 +149,15 @@ names. Checkpoints are W&B artifacts. Serverless Inference serves them as
   `--max-concurrency`.
 - The training API's handling of multi-image trajectories for Gemma 4 has not been checked against the live service
   from this repository. Run the pilot and inspect the W&B traces before a long run.
+
+## Hard-negative inpainting study
+
+`tasks/inpainting.py` takes extra parameters for the hard-negative study (defaults reproduce SSL-R1 exactly):
+SpatialSSRL's square mask and rotate/interior/exterior distractors (`{"mask": "square", "distractors": "spatial"}`),
+shifted regions, random regions of other images, and oracle hard negatives from other COCO images picked with COCO
+labels (`oracle-cat`: same main class; `oracle-dist`: closest label composition). See the module docstring for all
+options, including colour matching, uniform resampling and the context-blind probe.
+
+`hardneg.py` builds the oracle's label index (`build-index`) and runs phase 0's shortcut probes (`probe`): trivial
+solvers (boundary pixels, colour histogram, sharpness) per distractor scheme, plus preview sheets. `hardneg_phase0.sh`
+runs the whole phase 0, including base-model accuracy per scheme through `serverless.difficulty`.
