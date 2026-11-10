@@ -365,6 +365,10 @@ def solve_sharpness(context: Image.Image, box: Box, cands: list[Image.Image]) ->
                               - math.log1p(ref)) for c in cands]))
 
 
+def log_sharpness(img: Image.Image) -> float:
+    return math.log1p(laplacian_var(np.asarray(img.convert("RGB"), dtype=np.float32)))
+
+
 def solve_odd_sharpness(context: Image.Image, box: Box, cands: list[Image.Image]) -> int:
     """Context-free: the candidate with the median-ranked sharpness (GT sits between the zoomed-in and zoomed-out
     SpatialSSRL distractors). Ties to whichever is closest to the median."""

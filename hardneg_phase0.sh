@@ -35,13 +35,18 @@ declare -A SCHEMES=(
   [spatial-gap2]='{"mask": "square", "distractors": "spatial", "gap": 0.125}'
   [oracle-csel-meanstd-gap]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_select\": 8, \"color_match\": \"meanstd\", \"gap\": 0.0625, $ORACLE}"
   [oracle-csel-meanstd-gap2]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_select\": 8, \"color_match\": \"meanstd\", \"gap\": 0.125, $ORACLE}"
+  # third round: pick the negative that matches the true patch's colour and sharpness
+  [oracle-stats]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_select\": 8, \"select_by\": \"stats\", $ORACLE}"
+  [oracle-stats16]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_select\": 16, \"select_by\": \"stats\", $ORACLE}"
+  [oracle-stats-meanstd-gap2]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_select\": 16, \"select_by\": \"stats\", \"color_match\": \"meanstd\", \"gap\": 0.125, $ORACLE}"
+  [random-stats]='{"mask": "square", "distractors": "random", "color_select": 16, "select_by": "stats"}'
 )
 # SCHEMES_ONLY="a b c" restricts the probe step to those schemes
 if [[ -n "${SCHEMES_ONLY:-}" ]]; then
   declare -A KEEP=(); for k in $SCHEMES_ONLY; do KEEP[$k]=1; done
   for k in "${!SCHEMES[@]}"; do [[ -n "${KEEP[$k]:-}" ]] || unset "SCHEMES[$k]"; done
 fi
-VLM_SCHEMES=(spatial ssl-r1 random oracle oracle-color mixed)
+VLM_SCHEMES=(spatial ssl-r1 random oracle oracle-color mixed spatial-gap2 oracle-stats-meanstd-gap2)
 BLIND_SCHEMES=(spatial random oracle)
 
 if [[ $step == index || $step == all ]] && [[ ! -f $INDEX ]]; then

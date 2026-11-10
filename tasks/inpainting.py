@@ -18,7 +18,9 @@ Options for the hard-negative study (all deterministic given the puzzle's rng):
 - `color_match`: match every candidate's colours (the true patch too) to the band around the hole, when any
   distractor comes from another image: true/"hist" = RGB histogram matching, "meanstd" = mean/std in YCbCr.
 - `color_select`: for cross-image kinds, gather this many acceptable candidates and keep the one whose colours are
-  closest to the band around the hole (mines colour-similar negatives without editing pixels).
+  closest to the band around the hole (mines colour-similar negatives without editing pixels). With
+  `select_by="stats"` it keeps instead the one whose colour histogram and sharpness (log Laplacian variance) are
+  closest to the true patch's, so neither statistic separates the true patch from the distractors.
 - `gap`: the hole is larger than the patch by gap * min(w, h) on every side, so candidate edges never touch the
   surroundings and exact pixel continuation cannot decide the answer (a jigsaw-style gap).
 - `uniform_resample`: downsample every candidate by 2 and back, then JPEG, so sharpness cannot tell them apart.
@@ -36,6 +38,7 @@ import io
 import random
 from dataclasses import dataclass
 
+import numpy as np
 from PIL import Image
 
 from serverless.config import INPAINT_MIN_SIDE, INPAINT_RATIO, NUM_CHOICES
@@ -121,6 +124,7 @@ class InpaintingTask:
     boundary_filter: float | None = 1.0
     color_match: bool | str = False
     color_select: int = 1
+    select_by: str = "color"
     gap: float = 0.0
     uniform_resample: bool = False
     blind: bool = False
@@ -128,6 +132,8 @@ class InpaintingTask:
     kind: str = "choice"
 
     def __post_init__(self) -> None:
+        if self.select_by not in ("color", "stats"):
+            raise ValueError(f"select_by must be 'color' or 'stats', got {self.select_by!r}")
         if self.mask not in ("ratio", "square"):
             raise ValueError(f"mask must be 'ratio' or 'square', got {self.mask!r}")
         self.kinds = parse_kinds(self.distractors, self.choices - 1)
@@ -206,7 +212,15 @@ class InpaintingTask:
                 return True
             return hardneg.boundary_error(masked, hole, patch, inner=gt) > self.boundary_filter * gt_err
 
+        if self.select_by == "stats" and cross:
+            truth_hist = hardneg.color_hist(np.asarray(truth, dtype=np.float32).reshape(-1, 3))
+            truth_sharp = hardneg.log_sharpness(truth)
+
         def closest_color(found: list[tuple]) -> tuple:
+            if self.select_by == "stats":
+                # look like the true patch: same colour histogram and the same high-frequency energy
+                return min(found, key=lambda f: hardneg.color_distance(f[0], truth_hist)
+                           + abs(hardneg.log_sharpness(f[0]) - truth_sharp))
             return min(found, key=lambda f: hardneg.color_distance(f[0], ring_hist))
 
         def base(i: int) -> str:
