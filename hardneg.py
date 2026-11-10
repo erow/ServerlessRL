@@ -259,23 +259,39 @@ def ring_pixels(img: Image.Image, box: Box, width: int) -> np.ndarray:
     return arr[keep]
 
 
-def boundary_error(context: Image.Image, box: Box, patch: Image.Image, band: int = 2) -> float:
+def boundary_error(context: Image.Image, box: Box, patch: Image.Image, band: int = 2, inner: Box | None = None) -> float:
     """Mean absolute difference between the patch's outer `band` pixels and the context pixels just outside the hole,
-    over the sides of the hole that lie inside the image. Lower = the patch continues the surroundings better."""
+    over the sides of the hole that lie inside the image. Lower = the patch continues the surroundings better.
+
+    `inner` is where the patch sits when the hole is larger than the patch (a gap mask); the patch's edges are then
+    compared with the context across the gap."""
     x0, y0, x1, y1 = box
+    ix0, iy0, ix1, iy1 = inner or box
     W, H = context.size
     ctx = np.asarray(context.convert("RGB"), dtype=np.float32)
-    p = np.asarray(patch.convert("RGB").resize((x1 - x0, y1 - y0), Image.Resampling.BILINEAR), dtype=np.float32)
+    p = np.asarray(patch.convert("RGB").resize((ix1 - ix0, iy1 - iy0), Image.Resampling.BILINEAR), dtype=np.float32)
     diffs = []
     if y0 - band >= 0:
-        diffs.append(np.abs(ctx[y0 - band:y0, x0:x1][::-1] - p[:band]).mean())
+        diffs.append(np.abs(ctx[y0 - band:y0, ix0:ix1][::-1] - p[:band]).mean())
     if y1 + band <= H:
-        diffs.append(np.abs(ctx[y1:y1 + band, x0:x1] - p[-band:][::-1]).mean())
+        diffs.append(np.abs(ctx[y1:y1 + band, ix0:ix1] - p[-band:][::-1]).mean())
     if x0 - band >= 0:
-        diffs.append(np.abs(ctx[y0:y1, x0 - band:x0][:, ::-1] - p[:, :band]).mean())
+        diffs.append(np.abs(ctx[iy0:iy1, x0 - band:x0][:, ::-1] - p[:, :band]).mean())
     if x1 + band <= W:
-        diffs.append(np.abs(ctx[y0:y1, x1:x1 + band] - p[:, -band:][:, ::-1]).mean())
+        diffs.append(np.abs(ctx[iy0:iy1, x1:x1 + band] - p[:, -band:][:, ::-1]).mean())
     return float(np.mean(diffs)) if diffs else 0.0
+
+
+def color_hist(px: np.ndarray, bins: int = 16) -> np.ndarray:
+    """Concatenated per-channel histograms of (N, 3) pixels, normalised to sum 1."""
+    h = np.concatenate([np.histogram(px[:, c], bins=bins, range=(0, 256))[0] for c in range(3)]).astype(float)
+    return h / max(1.0, h.sum())
+
+
+def color_distance(patch: Image.Image, ref_hist: np.ndarray) -> float:
+    """Chi-square distance between a patch's colour histogram and a reference histogram."""
+    h = color_hist(np.asarray(patch.convert("RGB"), dtype=np.float32).reshape(-1, 3))
+    return float(0.5 * np.sum((h - ref_hist) ** 2 / (h + ref_hist + 1e-9)))
 
 
 def ahash(img: Image.Image, size: int = 8) -> int:
@@ -288,8 +304,23 @@ def near_duplicate(a: Image.Image, b: Image.Image, max_bits: int = 4) -> bool:
     return bin(ahash(a) ^ ahash(b)).count("1") <= max_bits
 
 
-def match_colors(patch: Image.Image, reference: np.ndarray) -> Image.Image:
-    """Per-channel histogram matching of `patch` to the reference pixels (N, 3)."""
+def match_colors(patch: Image.Image, reference: np.ndarray, method: str = "hist") -> Image.Image:
+    """Match `patch`'s colours to the reference pixels (N, 3).
+
+    'hist': per-channel RGB histogram matching (strong; can posterise). 'meanstd': per-channel mean and standard
+    deviation in YCbCr, with the scale clamped to [0.5, 2] (milder, keeps texture)."""
+    if method == "meanstd":
+        src = np.asarray(patch.convert("YCbCr"), dtype=np.float32)
+        ref = np.asarray(Image.fromarray(reference.reshape(-1, 1, 3).astype(np.uint8)).convert("YCbCr"),
+                         dtype=np.float32).reshape(-1, 3)
+        out = np.empty_like(src)
+        for c in range(3):
+            mu, sd = src[..., c].mean(), src[..., c].std()
+            scale = np.clip(ref[:, c].std() / max(sd, 1e-3), 0.5, 2.0)
+            out[..., c] = (src[..., c] - mu) * scale + ref[:, c].mean()
+        return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="YCbCr").convert("RGB")
+    if method != "hist":
+        raise ValueError(f"unknown colour matching method {method!r}")
     src = np.asarray(patch.convert("RGB"), dtype=np.float32)
     out = np.empty_like(src)
     for c in range(3):
@@ -313,24 +344,13 @@ def _ring_width(box: Box) -> int:
     return max(4, min(box[2] - box[0], box[3] - box[1]) // 4)
 
 
-def solve_boundary(context: Image.Image, box: Box, cands: list[Image.Image]) -> int:
-    return int(np.argmin([boundary_error(context, box, c) for c in cands]))
+def solve_boundary(context: Image.Image, box: Box, cands: list[Image.Image], inner: Box | None = None) -> int:
+    return int(np.argmin([boundary_error(context, box, c, inner=inner) for c in cands]))
 
 
 def solve_color(context: Image.Image, box: Box, cands: list[Image.Image]) -> int:
-    ring = ring_pixels(context, box, _ring_width(box))
-    bins = 16
-
-    def hist(px: np.ndarray) -> np.ndarray:
-        h = np.concatenate([np.histogram(px[:, c], bins=bins, range=(0, 256))[0] for c in range(3)]).astype(float)
-        return h / max(1.0, h.sum())
-
-    ref = hist(ring)
-    dists = []
-    for c in cands:
-        h = hist(np.asarray(c.convert("RGB"), dtype=np.float32).reshape(-1, 3))
-        dists.append(0.5 * np.sum((h - ref) ** 2 / (h + ref + 1e-9)))
-    return int(np.argmin(dists))
+    ref = color_hist(ring_pixels(context, box, _ring_width(box)))
+    return int(np.argmin([color_distance(c, ref) for c in cands]))
 
 
 def solve_sharpness(context: Image.Image, box: Box, cands: list[Image.Image]) -> int:
@@ -392,7 +412,12 @@ def probe(args: argparse.Namespace) -> None:
             for k, fn in SOLVERS.items():
                 if context is None and k in CONTEXT_SOLVERS:
                     continue
-                correct[k] += fn(context, box, cands) == gold
+                if k == "boundary":
+                    inner = puzzle.meta.get("patch_box")
+                    pred = fn(context, box, cands, tuple(inner) if inner else None)
+                else:
+                    pred = fn(context, box, cands)
+                correct[k] += pred == gold
             for kind in puzzle.meta.get("distractor_kinds", []):
                 meta_counts[kind] = meta_counts.get(kind, 0) + 1
             if len(previews) < args.preview:

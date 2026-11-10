@@ -26,7 +26,21 @@ declare -A SCHEMES=(
   [oracle-nofilter]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"boundary_filter\": null, $ORACLE}"
   [oracle-color]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_match\": true, $ORACLE}"
   [mixed]="{\"mask\": \"square\", \"distractors\": \"rot90,oracle-cat,oracle-dist\", $ORACLE}"
+  # second round: colour-mined negatives, milder colour transfer, gap mask
+  [random-csel]='{"mask": "square", "distractors": "random", "color_select": 8}'
+  [oracle-csel]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_select\": 8, $ORACLE}"
+  [oracle-meanstd]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_match\": \"meanstd\", $ORACLE}"
+  [oracle-csel-meanstd]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_select\": 8, \"color_match\": \"meanstd\", $ORACLE}"
+  [spatial-gap]='{"mask": "square", "distractors": "spatial", "gap": 0.0625}'
+  [spatial-gap2]='{"mask": "square", "distractors": "spatial", "gap": 0.125}'
+  [oracle-csel-meanstd-gap]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_select\": 8, \"color_match\": \"meanstd\", \"gap\": 0.0625, $ORACLE}"
+  [oracle-csel-meanstd-gap2]="{\"mask\": \"square\", \"distractors\": \"oracle-cat,oracle-dist,oracle-dist\", \"color_select\": 8, \"color_match\": \"meanstd\", \"gap\": 0.125, $ORACLE}"
 )
+# SCHEMES_ONLY="a b c" restricts the probe step to those schemes
+if [[ -n "${SCHEMES_ONLY:-}" ]]; then
+  declare -A KEEP=(); for k in $SCHEMES_ONLY; do KEEP[$k]=1; done
+  for k in "${!SCHEMES[@]}"; do [[ -n "${KEEP[$k]:-}" ]] || unset "SCHEMES[$k]"; done
+fi
 VLM_SCHEMES=(spatial ssl-r1 random oracle oracle-color mixed)
 BLIND_SCHEMES=(spatial random oracle)
 

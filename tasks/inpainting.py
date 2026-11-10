@@ -15,8 +15,12 @@ Options for the hard-negative study (all deterministic given the puzzle's rng):
     random      same-size region of a random other image, at native resolution
     oracle-cat  other-image region whose main COCO class matches (needs `oracle_index`)
     oracle-dist other-image region with the closest COCO label composition, stuff included (needs `oracle_index`)
-- `color_match`: histogram-match every candidate (the true patch too) to the band around the hole, when any
-  distractor comes from another image.
+- `color_match`: match every candidate's colours (the true patch too) to the band around the hole, when any
+  distractor comes from another image: true/"hist" = RGB histogram matching, "meanstd" = mean/std in YCbCr.
+- `color_select`: for cross-image kinds, gather this many acceptable candidates and keep the one whose colours are
+  closest to the band around the hole (mines colour-similar negatives without editing pixels).
+- `gap`: the hole is larger than the patch by gap * min(w, h) on every side, so candidate edges never touch the
+  surroundings and exact pixel continuation cannot decide the answer (a jigsaw-style gap).
 - `uniform_resample`: downsample every candidate by 2 and back, then JPEG, so sharpness cannot tell them apart.
 - `blind`: drop the masked image from the prompt (context-blind shortcut probe).
 
@@ -115,7 +119,9 @@ class InpaintingTask:
     oracle_index: str | None = None
     oracle_pool: int = 300
     boundary_filter: float | None = 1.0
-    color_match: bool = False
+    color_match: bool | str = False
+    color_select: int = 1
+    gap: float = 0.0
     uniform_resample: bool = False
     blind: bool = False
     name: str = "inpainting"
@@ -135,20 +141,25 @@ class InpaintingTask:
         w, h = sample_mask_size(rng, width, height, self.ratio, self.min_side)
         return random_box(rng, width, height, w, h)
 
+    def _hole(self, gt: Box, width: int, height: int) -> Box:
+        g = round(self.gap * min(gt[2] - gt[0], gt[3] - gt[1]))
+        return max(0, gt[0] - g), max(0, gt[1] - g), min(width, gt[2] + g), min(height, gt[3] + g)
+
     def generate(self, rng: random.Random, source: ImageSource) -> Puzzle:
         for _ in range(10):
             idx, img = source.sample(rng)
             width, height = img.size
             try:
                 gt = self._mask_box(rng, width, height)
-                patches, info = self._distractors(rng, source, idx, img, gt)
+                hole = self._hole(gt, width, height)
+                patches, info = self._distractors(rng, source, idx, img, gt, hole)
             except ValueError:
                 continue
             break
         else:
             raise RuntimeError("inpainting: no image admitted distinct distractors")
         masked = img.copy()
-        masked.paste((0, 0, 0), gt)
+        masked.paste((0, 0, 0), hole)
         truth = info.pop("truth", None) or img.crop(gt)
         if self.uniform_resample:
             truth, patches = uniform_resample(truth), [uniform_resample(p) for p in patches]
@@ -160,13 +171,15 @@ class InpaintingTask:
         else:
             parts = choice_parts(["You are given an image with a missing part.\n", masked], candidates,
                                  "Determine the candidate image that best fits the missing part of the original image.")
-        meta = {"image": source.names[idx], "mask_box": list(gt), "distractor_kinds": list(self.kinds), **info}
+        meta = {"image": source.names[idx], "mask_box": list(hole), "distractor_kinds": list(self.kinds), **info}
+        if hole != gt:
+            meta["patch_box"] = list(gt)
         return Puzzle(self.name, parts, answer, "choice", meta)
 
     # ------------------------------------------------------------------------------------------- distractors
 
     def _distractors(self, rng: random.Random, source: ImageSource, idx: int, img: Image.Image,
-                     gt: Box) -> tuple[list[Image.Image], dict]:
+                     gt: Box, hole: Box) -> tuple[list[Image.Image], dict]:
         from serverless import hardneg
 
         width, height = img.size
@@ -174,9 +187,11 @@ class InpaintingTask:
         w, h = x1 - x0, y1 - y0
         truth = img.crop(gt)
         masked = img.copy()
-        masked.paste((0, 0, 0), gt)
+        masked.paste((0, 0, 0), hole)
         cross = any(k in CROSS_IMAGE for k in self.kinds)
-        gt_err = hardneg.boundary_error(masked, gt, truth) if cross else None
+        gt_err = hardneg.boundary_error(masked, hole, truth, inner=gt) if cross else None
+        ring = hardneg.ring_pixels(masked, hole, max(4, min(w, h) // 4)) if cross else None
+        ring_hist = hardneg.color_hist(ring) if cross else None
         patches: list[Image.Image] = []
         sources: list[dict] = []
         used_images = {idx}
@@ -189,7 +204,10 @@ class InpaintingTask:
                 return False
             if self.boundary_filter is None:
                 return True
-            return hardneg.boundary_error(masked, gt, patch) > self.boundary_filter * gt_err
+            return hardneg.boundary_error(masked, hole, patch, inner=gt) > self.boundary_filter * gt_err
+
+        def closest_color(found: list[tuple]) -> tuple:
+            return min(found, key=lambda f: hardneg.color_distance(f[0], ring_hist))
 
         def base(i: int) -> str:
             return source.names[i].rsplit("/", 1)[-1]
@@ -226,16 +244,20 @@ class InpaintingTask:
                 patches.append(img.crop(box))
                 sources.append({"kind": kind, "box": list(box)})
             elif kind == "random":
-                for _ in range(30):
+                found = []
+                for _ in range(30 * self.color_select):
                     j, other = source.sample(rng, exclude=used_images)
                     if other.width < w or other.height < h:
                         continue
                     box = random_box(rng, other.width, other.height, w, h)
                     patch = other.crop(box)
                     if accept(patch):
-                        break
-                else:
+                        found.append((patch, j, box))
+                        if len(found) == self.color_select:
+                            break
+                if not found:
                     raise ValueError("no random cross-image distractor passed the filters")
+                patch, j, box = closest_color(found)
                 used_images.add(j)
                 patches.append(patch)
                 sources.append({"kind": kind, "image": source.names[j], "box": list(box)})
@@ -244,6 +266,7 @@ class InpaintingTask:
                 pool = [rng.randrange(len(source)) for _ in range(self.oracle_pool)]
                 matches = hardneg.oracle_candidates(index, base(idx), gt, kind.split("-")[1],
                                                     [base(i) for i in pool if i not in used_images])
+                found = []
                 for m in matches:
                     j = source.index_of(m.name)
                     if j is None or j in used_images:
@@ -255,9 +278,12 @@ class InpaintingTask:
                     box = (bx0, by0, bx0 + w, by0 + h)
                     patch = other.crop(box)
                     if accept(patch):
-                        break
-                else:
+                        found.append((patch, j, box, m))
+                        if len(found) == self.color_select:
+                            break
+                if not found:
                     raise ValueError(f"no {kind} distractor passed the filters")
+                patch, j, box, m = closest_color(found)
                 used_images.add(j)
                 patches.append(patch)
                 sources.append({"kind": kind, "image": m.name, "box": list(box), "score": m.score,
@@ -267,7 +293,7 @@ class InpaintingTask:
             info["gt_boundary_error"] = gt_err
         if self.color_match and cross:
             # every candidate, the true patch included, so "the only unmatched one" is not a tell
-            ring = hardneg.ring_pixels(masked, gt, max(4, min(w, h) // 4))
-            info["truth"] = hardneg.match_colors(truth, ring)
-            patches = [hardneg.match_colors(p, ring) for p in patches]
+            method = "hist" if self.color_match is True else self.color_match
+            info["truth"] = hardneg.match_colors(truth, ring, method)
+            patches = [hardneg.match_colors(p, ring, method) for p in patches]
         return patches, info
