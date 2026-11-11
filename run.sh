@@ -26,4 +26,5 @@ export PYTHONPATH="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pw
 # Remote endpoints need network access; the offline HF flags from submit.sh are irrelevant here.
 unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}" TOKENIZERS_PARALLELISM=false
-exec python -m serverless.train "$@"
+# SERVERLESS_ENTRY=serverless.caption_game runs the masked-view caption game instead of the SSL-R1 puzzles.
+exec python -m "${SERVERLESS_ENTRY:-serverless.train}" "$@"
