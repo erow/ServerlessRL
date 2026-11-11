@@ -57,25 +57,38 @@ CONFIG = dict(
     RESUME=True,                     # resume ARM from HF_REPO/<ARM>/latest if present
     WANDB_PROJECT="sslvlm-kaggle",   # used only if Kaggle secret WANDB_API_KEY exists
     SEED=0,
+    GEN_BATCH=16,                    # sequences generated together (caption game)
+    # Masked caption game (ARM capgame-*): forger-only against a frozen captioner and judge (the base model,
+    # i.e. LoRA disabled), as in runs v4-v7 on W&B Serverless.
+    CG_MASK_RATIO=0.3, CG_IMAGES_PER_STEP=8, CG_CAPTION_SAMPLES=4, CG_JUDGE_SAMPLES=4,
+    CG_CAPTION_MAX_TOKENS=320, CG_JUDGE_MAX_TOKENS=768, CG_VAL_IMAGES=32,
+    CG_FOOL_WEIGHT=0.5, CG_CONTENT_WEIGHT=0.5, CG_CONTENT_METRIC="recall", CG_GATE_PENALTY=-0.5,
 )
 CONFIG_OVERRIDES = {}
-CONFIG.update(CONFIG_OVERRIDES)
 
-# Arms of the hard-negative inpainting study (plan doc phase 1) plus the SSL-R1 multi-task baseline.
-# "oracle_index" = "auto" builds the COCO label index for the split on first use.
+# Arms of the hard-negative inpainting study (plan doc phase 1), the SSL-R1 multi-task baseline, and the masked
+# caption game. "oracle_index" = "auto" builds the COCO label index for the split on first use. An arm's
+# "config" entries apply unless CONFIG_OVERRIDES sets the same key.
 SQ = {"mask": "square"}
 ARMS = {
-    "A-spatial": ("inpainting", {"inpainting": {**SQ, "distractors": "spatial"}}),
-    "B-oracle":  ("inpainting", {"inpainting": {**SQ, "distractors": "oracle-cat,oracle-dist,oracle-dist",
-                                                "oracle_index": "auto"}}),
-    "C-mixed":   ("inpainting", {"inpainting": {**SQ, "distractors": "rot90,oracle-cat,oracle-dist",
-                                                "oracle_index": "auto"}}),
-    "D-random":  ("inpainting", {"inpainting": {**SQ, "distractors": "random"}}),
-    "ssl-r1":    ("ssl-r1", {}),
+    "A-spatial": dict(game="puzzles", tasks="inpainting", task_params={"inpainting": {**SQ, "distractors": "spatial"}}),
+    "B-oracle":  dict(game="puzzles", tasks="inpainting", task_params={"inpainting": {
+        **SQ, "distractors": "oracle-cat,oracle-dist,oracle-dist", "oracle_index": "auto"}}),
+    "C-mixed":   dict(game="puzzles", tasks="inpainting", task_params={"inpainting": {
+        **SQ, "distractors": "rot90,oracle-cat,oracle-dist", "oracle_index": "auto"}}),
+    "D-random":  dict(game="puzzles", tasks="inpainting", task_params={"inpainting": {**SQ, "distractors": "random"}}),
+    "ssl-r1":    dict(game="puzzles", tasks="ssl-r1", task_params={}),
+    # v7 on Kaggle: v6 settings (mask 0.3, forger-only, thinking off) with lr 3e-5, 100 steps.
+    "capgame-v7": dict(game="caption", config=dict(REPO_REF="masked-caption-game", LR=3e-5, STEPS=100,
+                                                   VAL_EVERY=20, SAVE_EVERY=10)),
 }
-TASKS, TASK_PARAMS = ARMS[CONFIG["ARM"]]
-CONFIG.setdefault("TASKS", TASKS)
-CONFIG.setdefault("TASK_PARAMS", TASK_PARAMS)
+ARM = ARMS[CONFIG_OVERRIDES.get("ARM", CONFIG["ARM"])]
+for k, v in ARM.get("config", {}).items():
+    CONFIG[k] = v
+CONFIG.update(CONFIG_OVERRIDES)
+GAME = ARM["game"]
+CONFIG.setdefault("TASKS", ARM.get("tasks"))
+CONFIG.setdefault("TASK_PARAMS", ARM.get("task_params", {}))
 CONFIG
 """)
 
@@ -138,16 +151,32 @@ def task_params(split):
 
 from serverless.config import FORMAT_PROMPT
 from serverless.images import ImageSource
-from serverless.objective import Objective
 
 train_src, val_src = ImageSource(TRAIN_DIR), ImageSource(VAL_DIR)
-train_obj = Objective.from_spec(CONFIG["TASKS"], task_params=task_params("train2017"), seed=CONFIG["SEED"],
-                                format_reward=CONFIG["FORMAT_REWARD"])
-val_obj = Objective.from_spec(CONFIG["TASKS"], task_params=task_params("val2017"), seed=CONFIG["SEED"],
-                              format_reward=CONFIG["FORMAT_REWARD"])
 print(len(train_src), "train images,", len(val_src), "val images")
-p = train_obj.batch(train_src, "train", 0, 1)[0]
-print(p.task, p.answer, p.text[:300])
+if GAME == "puzzles":
+    from serverless.objective import Objective
+    train_obj = Objective.from_spec(CONFIG["TASKS"], task_params=task_params("train2017"), seed=CONFIG["SEED"],
+                                    format_reward=CONFIG["FORMAT_REWARD"])
+    val_obj = Objective.from_spec(CONFIG["TASKS"], task_params=task_params("val2017"), seed=CONFIG["SEED"],
+                                  format_reward=CONFIG["FORMAT_REWARD"])
+    p = train_obj.batch(train_src, "train", 0, 1)[0]
+    print(p.task, p.answer, p.text[:300])
+else:
+    # caption_game imports message_reasoning from serverless.train, which pulls in the W&B/ART client; a stub
+    # is enough because thinking is off here.
+    import types
+    _stub = types.ModuleType("serverless.train")
+    _stub.message_reasoning = lambda message: getattr(message, "reasoning", None)
+    sys.modules["serverless.train"] = _stub
+    import serverless.caption_game as CG
+    CG_CFG = CG.GameConfig(
+        caption_samples=CONFIG["CG_CAPTION_SAMPLES"], judge_samples=CONFIG["CG_JUDGE_SAMPLES"],
+        temperature=CONFIG["TEMPERATURE"], format_reward=CONFIG["FORMAT_REWARD"],
+        forger_fool_weight=CONFIG["CG_FOOL_WEIGHT"], forger_content_weight=CONFIG["CG_CONTENT_WEIGHT"],
+        content_metric=CONFIG["CG_CONTENT_METRIC"], gate_penalty=CONFIG["CG_GATE_PENALTY"], thinking=False)
+    name, img, rng = CG.step_images(train_src, CONFIG["SEED"], "train", 0, 1)[0]
+    print("caption game:", name, img.size, CG.salient_box(rng, img, CONFIG["CG_MASK_RATIO"], 8, 28))
 """)
 
 code("""
@@ -262,6 +291,134 @@ def lora_delta_norms():
             tot["vision" if "visual" in name else "language"] += d ** 2
     return {f"lora_delta/{k}": v ** 0.5 for k, v in tot.items()}
 
+def policy_update(rollouts):
+    \"\"\"One GRPO step from (inputs, completion ids, advantage); token-level normalization over the batch.\"\"\"
+    FastVisionModel.for_training(model)
+    optimizer.zero_grad(set_to_none=True)
+    n_tok = max(1, sum(len(c) for _, c, _ in rollouts))
+    for inputs, comp, adv in rollouts:
+        loss = -adv * completion_logprob(inputs, comp) / n_tok
+        scaler.scale(loss).backward()
+    if not rollouts:
+        return 0.0
+    scaler.unscale_(optimizer)
+    grad_norm = torch.nn.utils.clip_grad_norm_(trainable, CONFIG["MAX_GRAD_NORM"]).item()
+    scaler.step(optimizer)
+    scaler.update()
+    return grad_norm
+
+def group_advantages(rewards):
+    \"\"\"GRPO advantages for one group, or None when all rewards are equal (no signal).\"\"\"
+    mu, sd = statistics.mean(rewards), statistics.pstdev(rewards)
+    return None if sd <= 1e-6 else [(r - mu) / (sd + 1e-4) for r in rewards]
+
+# ---- batched generation for the caption game (chat-completions-style messages with data-URI images)
+import asyncio, base64, contextlib, io, statistics
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+def _decode(url):
+    return Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB")
+
+def chat_inputs(messages):
+    content, images = [], []
+    for c in messages[0]["content"]:
+        if c["type"] == "image_url":
+            content.append({"type": "image"}); images.append(_decode(c["image_url"]["url"]))
+        else:
+            content.append({"type": "text", "text": c["text"]})
+    text = processor.apply_chat_template([{"role": "user", "content": content}],
+                                         tokenize=False, add_generation_prompt=True)
+    return text, images
+
+def encode_messages(messages):
+    text, images = chat_inputs(messages)
+    return processor(text=[text], images=images, return_tensors="pt").to("cuda")
+
+@torch.no_grad()
+def generate_many(prompts, n, max_new_tokens, temperature, adapter=True):
+    \"\"\"n samples for each prompt (list of messages), batched with left padding. Returns [[(ids, text)] * n].\"\"\"
+    FastVisionModel.for_inference(model)
+    TOK.padding_side = "left"
+    greedy = temperature == 0
+    k = 1 if greedy else n
+    kw = dict(max_new_tokens=max_new_tokens, pad_token_id=PAD_ID, use_cache=True)
+    kw.update(do_sample=False) if greedy else kw.update(do_sample=True, temperature=temperature, top_p=CONFIG["TOP_P"])
+    per = max(1, CONFIG["GEN_BATCH"] // k)
+    results = []
+    with (contextlib.nullcontext() if adapter else model.disable_adapter()):
+        for i in range(0, len(prompts), per):
+            chunk = [chat_inputs(m) for m in prompts[i : i + per]]
+            try:
+                inputs = processor(text=[t for t, _ in chunk], images=[im for _, ims in chunk for im in ims],
+                                   padding=True, return_tensors="pt").to("cuda")
+                out = model.generate(**inputs, num_return_sequences=k, **kw)
+                plen = inputs["input_ids"].shape[1]
+                rows = [[trim(s[plen:]) for s in out[j * k : (j + 1) * k]] for j in range(len(chunk))]
+            except Exception as e:  # fall back to one prompt and one sample at a time
+                print("batched generate failed, looping:", repr(e)[:200])
+                rows = []
+                for text, ims in chunk:
+                    inp = processor(text=[text], images=ims, return_tensors="pt").to("cuda")
+                    pl = inp["input_ids"].shape[1]
+                    rows.append([trim(model.generate(**inp, **kw)[0, pl:]) for _ in range(k)])
+            for seqs in rows:
+                seqs = seqs * (n // k)
+                results.append([(s, TOK.decode(s, skip_special_tokens=True)) for s in seqs])
+    return results
+
+class LocalBackend:
+    \"\"\"`complete(messages, temperature, role)` for caption_game.play, run on the local model.
+
+    Calls made while play() coroutines are gathered are collected and generated together; identical messages
+    (the G samples of one prompt) become one prompt with num_return_sequences=G. Roles in `trained` use the
+    LoRA policy, every other role the frozen base model (LoRA disabled).\"\"\"
+
+    def __init__(self, trained=("forger",)):
+        self.trained, self.pending, self.flusher = set(trained), [], None
+
+    async def complete(self, messages, temperature, role):
+        fut = asyncio.get_running_loop().create_future()
+        self.pending.append((messages, temperature, role, fut))
+        if self.flusher is None or self.flusher.done():
+            self.flusher = asyncio.ensure_future(self._flush())
+        return await fut
+
+    async def _flush(self):
+        for _ in range(50):  # let every gathered coroutine reach its complete() call
+            await asyncio.sleep(0)
+        batch, self.pending = self.pending, []
+        groups = {}
+        for messages, temp, role, fut in batch:
+            groups.setdefault((role, temp), {}).setdefault(id(messages), (messages, []))[1].append(fut)
+        for (role, temp), prompts in groups.items():
+            by_n = {}
+            for messages, futs in prompts.values():
+                by_n.setdefault(len(futs), []).append((messages, futs))
+            limit = CONFIG["CG_JUDGE_MAX_TOKENS"] if role == "judge" else CONFIG["CG_CAPTION_MAX_TOKENS"]
+            for n, items in by_n.items():
+                try:
+                    outs = generate_many([m for m, _ in items], n, limit, temp, adapter=role in self.trained)
+                except Exception as e:
+                    for _, futs in items:
+                        for f in futs:
+                            f.set_exception(e)
+                    continue
+                for (_, futs), samples in zip(items, outs):
+                    for f, (ids, text) in zip(futs, samples):
+                        msg = SimpleNamespace(content=text, reasoning=None, model_extra={})
+                        f.set_result(SimpleNamespace(choices=[SimpleNamespace(message=msg, logprobs=None)], ids=ids))
+
+def play_images(images, game, temperature=None):
+    \"\"\"caption_game.play on every image, with batched local generation (in a worker thread: Jupyter's
+    own event loop is already running).\"\"\"
+    async def go():
+        backend = LocalBackend()
+        return await asyncio.gather(*[CG.play(game, backend.complete, img, name, CONFIG["CG_MASK_RATIO"], rng,
+                                              temperature) for name, img, rng in images])
+    with ThreadPoolExecutor(1) as ex:
+        return ex.submit(asyncio.run, go()).result()
+
 # ---- checkpoints (local + optional HF Hub for resume across 12 h sessions)
 from kaggle_secrets import UserSecretsClient
 def secret(name):
@@ -276,6 +433,7 @@ if CONFIG["HF_REPO"] and not HF_TOKEN:
 
 def save(step, optimizer, scaler):
     ck = OUT / "latest"
+    ck.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(ck)
     torch.save({"step": step, "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict()}, ck / "trainer.pt")
     (ck / "config.json.run").write_text(json.dumps({**CONFIG, "repo_commit": REPO_COMMIT, "step": step}, indent=1))
@@ -308,7 +466,7 @@ def try_resume(optimizer, scaler):
 """)
 
 code("""
-# Cell 6: GRPO training loop. On-policy, one update per batch (so the PPO ratio is 1), no KL (as in SSL-R1),
+# Cell 6: training. GRPO, on-policy with one update per batch (so the PPO ratio is 1), no KL (as in SSL-R1),
 # group-normalized advantages, token-level loss normalization over the whole step.
 import random, statistics
 
@@ -327,19 +485,20 @@ def log(row):
         run.log(row, step=row["step"])
     print({k: round(v, 3) if isinstance(v, float) else v for k, v in row.items()})
 
+def append(name, rows):
+    with open(OUT / name, "a") as f:
+        f.writelines(json.dumps(r, default=str) + "\\n" for r in rows)
+
 optimizer = torch.optim.AdamW(trainable, lr=CONFIG["LR"], betas=(0.9, 0.99), weight_decay=0.0)
 scaler = torch.amp.GradScaler("cuda", enabled=AMP_DTYPE == torch.float16)
 start = try_resume(optimizer, scaler)
-(OUT / "run_config.json").write_text(json.dumps({**CONFIG, "repo_commit": REPO_COMMIT,
-                                                 "objective": train_obj.describe()}, indent=1, default=str))
-t0 = time.time()
-if start == 0 and CONFIG["VAL_EVERY"]:
-    log({"step": 0, **evaluate(0)})
+import dataclasses
+(OUT / "run_config.json").write_text(json.dumps(
+    {**CONFIG, "repo_commit": REPO_COMMIT,
+     "objective": train_obj.describe() if GAME == "puzzles" else dataclasses.asdict(CG_CFG)},
+    indent=1, default=str))
 
-step = start
-for step in range(start + 1, CONFIG["STEPS"] + 1):
-    ts = time.time()
-    torch.manual_seed(CONFIG["SEED"] * 100003 + step)
+def puzzle_step(step):
     puzzles = train_obj.batch(train_src, "train", step, CONFIG["PROMPTS_PER_STEP"])
     rollouts, rewards, accs, lens, samples = [], [], [], [], []
     for pz in puzzles:
@@ -347,40 +506,68 @@ for step in range(start + 1, CONFIG["STEPS"] + 1):
         seqs, texts = generate(inputs, CONFIG["GROUP_SIZE"])
         scores = [train_obj.score(pz, t) for t in texts]
         r = [s.reward for s in scores]
-        mu, sd = statistics.mean(r), statistics.pstdev(r)
         rewards += r; accs += [s.accuracy for s in scores]; lens += [len(s) for s in seqs]
         samples.append({"step": step, "id": pz.meta["puzzle_id"], "task": pz.task, "answer": pz.answer,
                         "rewards": r, "response": texts[0]})
-        if sd > 1e-6:  # a group with equal rewards carries no GRPO signal
-            rollouts += [(inputs, s, (ri - mu) / (sd + 1e-4)) for s, ri in zip(seqs, r)]
-    gen_s = time.time() - ts
+        adv = group_advantages(r)
+        if adv:
+            rollouts += [(inputs, s, a) for s, a in zip(seqs, adv)]
+    append("samples.jsonl", samples)
+    return rollouts, {"train/reward": statistics.mean(rewards), "train/accuracy": statistics.mean(accs),
+                      "train/completion_tokens": statistics.mean(lens),
+                      "train/truncated": sum(l >= CONFIG["MAX_NEW_TOKENS"] for l in lens) / len(lens),
+                      "train/groups_with_signal": len(rollouts) / CONFIG["GROUP_SIZE"] / len(puzzles)}
 
-    FastVisionModel.for_training(model)
-    optimizer.zero_grad(set_to_none=True)
-    n_tok = max(1, sum(len(s) for _, s, _ in rollouts))
-    for inputs, comp, adv in rollouts:
-        loss = -adv * completion_logprob(inputs, comp) / n_tok
-        scaler.scale(loss).backward()
-    grad_norm = 0.0
-    if rollouts:
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, CONFIG["MAX_GRAD_NORM"]).item()
-        scaler.step(optimizer)
-        scaler.update()
-    with open(OUT / "samples.jsonl", "a") as f:
-        f.writelines(json.dumps(s) + "\\n" for s in samples)
-    row = {"step": step, "train/reward": statistics.mean(rewards), "train/accuracy": statistics.mean(accs),
-           "train/completion_tokens": statistics.mean(lens), "train/truncated": sum(l >= CONFIG["MAX_NEW_TOKENS"] for l in lens) / len(lens),
-           "train/groups_with_signal": len(rollouts) / CONFIG["GROUP_SIZE"] / len(puzzles),
-           "train/grad_norm": grad_norm, "time/gen_s": gen_s, "time/step_s": time.time() - ts}
+def caption_step(step):
+    images = CG.step_images(train_src, CONFIG["SEED"], "train", step, CONFIG["CG_IMAGES_PER_STEP"])
+    results = play_images(images, CG_CFG)
+    rollouts, samples = [], []
+    for res in results:
+        fakes = res.forgeries
+        adv = group_advantages([f.reward for f in fakes])
+        if adv:
+            inputs = encode_messages(fakes[0].messages)  # all forgeries of an image share one prompt
+            rollouts += [(inputs, f.completion.ids, a) for f, a in zip(fakes, adv)]
+        samples.append({"step": step, "image": res.image, "box": res.box,
+                        "real": [c.text for c in res.captions], "forged": [f.text for f in fakes],
+                        "forger_reward": [f.reward for f in fakes], "gate": [f.metadata.get("gate") for f in fakes]})
+    append("samples.jsonl", samples)
+    stats = {f"train/{k}": v for k, v in CG.mean_stats(results).items()}
+    stats["train/groups_with_signal"] = len(rollouts) / CONFIG["CG_CAPTION_SAMPLES"] / len(results)
+    return rollouts, stats
+
+def caption_evaluate(step):
+    \"\"\"Greedy game on fixed val2017 images: one caption, one forgery, one judgement each (as on W&B).\"\"\"
+    images = CG.step_images(val_src, CONFIG["SEED"], "val", 0, CONFIG["CG_VAL_IMAGES"])
+    results = play_images(images, dataclasses.replace(CG_CFG, caption_samples=1, judge_samples=1), temperature=0.0)
+    append(f"val_games_step{step:05d}.jsonl", [
+        {"image": r.image, "box": r.box, "real": r.captions[0].text, "forged": r.forgeries[0].text,
+         "forger_reward": r.forgeries[0].reward, "stats": r.stats} for r in results])
+    return {f"val/{k}": v for k, v in CG.mean_stats(results).items()}
+
+train_step = puzzle_step if GAME == "puzzles" else caption_step
+val_fn = evaluate if GAME == "puzzles" else caption_evaluate
+
+t0 = time.time()
+if start == 0 and CONFIG["VAL_EVERY"]:
+    log({"step": 0, **val_fn(0)})
+step = start
+for step in range(start + 1, CONFIG["STEPS"] + 1):
+    ts = time.time()
+    torch.manual_seed(CONFIG["SEED"] * 100003 + step)
+    rollouts, row = train_step(step)
+    gen_s = time.time() - ts
+    row = {"step": step, **row, "train/grad_norm": policy_update(rollouts), "time/gen_s": gen_s,
+           "time/step_s": time.time() - ts}
+    del rollouts
     if CONFIG["VAL_EVERY"] and step % CONFIG["VAL_EVERY"] == 0:
-        row.update(evaluate(step)); row.update(lora_delta_norms())
+        row.update(val_fn(step)); row.update(lora_delta_norms())
     log(row)
     out_of_time = (time.time() - t0) / 3600 > CONFIG["TIME_BUDGET_H"]
     if step % CONFIG["SAVE_EVERY"] == 0 or step == CONFIG["STEPS"] or out_of_time:
         save(step, optimizer, scaler)
     if out_of_time:
-        print(f"time budget reached at step {step}; rerun with RESUME=True and HF_REPO set to continue")
+        print(f"time budget reached at step {step}; rerun the same ARM with HF_REPO set to continue")
         break
 """)
 
@@ -392,7 +579,6 @@ if run:
 for p in sorted(OUT.iterdir()):
     print(p)
 """)
-
 
 def build(path: Path) -> None:
     def lines(src: str) -> list[str]:

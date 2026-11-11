@@ -17,7 +17,8 @@ pip install -U kaggle            # token in ~/.kaggle/kaggle.json (never commit 
 ```
 
 Arms (cell 2): `A-spatial` (SpatialSSRL distractors), `B-oracle`, `C-mixed`, `D-random` (hard-negative plan,
-phase 1), `ssl-r1` (all five SSL-R1 tasks). Any `CONFIG` key can be overridden as `KEY=VALUE`.
+phase 1), `ssl-r1` (all five SSL-R1 tasks), and `capgame-v7` (masked caption game, below). Any `CONFIG` key can
+be overridden as `KEY=VALUE`.
 Oracle arms build the COCO label index from the dataset's `instances_*.json` on first use.
 
 Training: on-policy GRPO, one update per batch, group-normalized advantages, no KL (SSL-R1), token-level loss
@@ -32,5 +33,9 @@ Long runs: a Kaggle session stops at ~12 h (the notebook saves at `TIME_BUDGET_H
 the Kaggle secret `HF_TOKEN`; rerunning the same arm then resumes from `<HF_REPO>/<ARM>/latest`. Add the
 secret `WANDB_API_KEY` to log to W&B project `sslvlm-kaggle`.
 
-Not ported yet: the masked caption game (it needs a frozen captioner and judge per rollout, roughly 3x the
-generation cost on one T4).
+Caption game (`capgame-v7`): clones `masked-caption-game` and calls its `caption_game.play` unchanged, with a
+local backend: the forger samples from the LoRA policy, the captioner and judge from the frozen base model (LoRA
+disabled), i.e. the forger-only setup of runs v4-v7. Settings follow v6 (mask 0.3, 8 images x 4 captions x 4
+judgements, recall content, gate penalty -0.5, thinking off) with lr 3e-5 and 100 steps. All pending calls of a
+step are generated together (identical prompts as one prompt with `num_return_sequences`). The base model is
+Qwen3-VL-8B, not Gemma 4, so compare against this run's own step 0, not against v6.
