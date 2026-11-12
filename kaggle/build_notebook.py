@@ -52,6 +52,7 @@ CONFIG = dict(
     FORMAT_REWARD=0.2,
     VAL_EVERY=20, VAL_N=48,          # greedy held-out eval on val2017 puzzles (0 disables)
     SAVE_EVERY=20,
+    VAL_AT_START=True,               # step-0 eval; false skips it (e.g. to reach the first update fast)
     TIME_BUDGET_H=11.0,              # stop and save before Kaggle's 12 h limit
     HF_REPO="",                      # e.g. "you/sslvlm-kaggle"; needs Kaggle secret HF_TOKEN; enables resume
     RESUME=True,                     # resume ARM from HF_REPO/<ARM>/latest if present
@@ -253,9 +254,19 @@ def generate(inputs, n, greedy=False):
 
 def completion_logprob(inputs, comp):
     \"\"\"Sum of log p(completion | prompt, images) under the current policy, with gradients.\"\"\"
+    # generate() runs under torch.inference_mode, and autograd refuses to save inference tensors for backward
+    # (gather's index, the vision inputs): clone them into normal tensors first.
+    comp = comp.clone()
+    inputs = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in inputs.items()}
     plen = inputs["input_ids"].shape[1]
     ids = torch.cat([inputs["input_ids"][0], comp]).unsqueeze(0)
     extra = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
+    # Per-token processor outputs (transformers 5.x: mm_token_type_ids) cover only the prompt; extend them over
+    # the completion as text tokens (0), or get_rope_index fails on mismatched lengths.
+    for k in ("mm_token_type_ids", "token_type_ids"):
+        v = extra.get(k)
+        if v is not None and v.shape[-1] == plen:
+            extra[k] = torch.cat([v, v.new_zeros(*v.shape[:-1], len(comp))], -1)
     with torch.autocast("cuda", dtype=AMP_DTYPE):
         logits = model(input_ids=ids, attention_mask=torch.ones_like(ids), **extra).logits
     logits = logits[0, plen - 1 : plen - 1 + len(comp)].float()
@@ -549,7 +560,7 @@ train_step = puzzle_step if GAME == "puzzles" else caption_step
 val_fn = evaluate if GAME == "puzzles" else caption_evaluate
 
 t0 = time.time()
-if start == 0 and CONFIG["VAL_EVERY"]:
+if start == 0 and CONFIG["VAL_EVERY"] and CONFIG["VAL_AT_START"]:
     log({"step": 0, **val_fn(0)})
 step = start
 for step in range(start + 1, CONFIG["STEPS"] + 1):
