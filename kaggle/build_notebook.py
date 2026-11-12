@@ -256,6 +256,12 @@ def completion_logprob(inputs, comp):
     plen = inputs["input_ids"].shape[1]
     ids = torch.cat([inputs["input_ids"][0], comp]).unsqueeze(0)
     extra = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
+    # Per-token processor outputs (transformers 5.x: mm_token_type_ids) cover only the prompt; extend them over
+    # the completion as text tokens (0), or get_rope_index fails on mismatched lengths.
+    for k in ("mm_token_type_ids", "token_type_ids"):
+        v = extra.get(k)
+        if v is not None and v.shape[-1] == plen:
+            extra[k] = torch.cat([v, v.new_zeros(*v.shape[:-1], len(comp))], -1)
     with torch.autocast("cuda", dtype=AMP_DTYPE):
         logits = model(input_ids=ids, attention_mask=torch.ones_like(ids), **extra).logits
     logits = logits[0, plen - 1 : plen - 1 + len(comp)].float()
