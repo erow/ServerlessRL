@@ -37,5 +37,7 @@ Caption game (`capgame-v7`): clones `masked-caption-game` and calls its `caption
 local backend: the forger samples from the LoRA policy, the captioner and judge from the frozen base model (LoRA
 disabled), i.e. the forger-only setup of runs v4-v7. Settings follow v6 (mask 0.3, 8 images x 4 captions x 4
 judgements, recall content, gate penalty -0.5, thinking off) with lr 3e-5 and 100 steps. All pending calls of a
-step are generated together (identical prompts as one prompt with `num_return_sequences`). The base model is
+step are generated together (identical prompts as one prompt with `num_return_sequences`). With two GPUs
+(Kaggle T4 x2) a second copy of the base model on cuda:1 serves the frozen roles in parallel with the policy;
+judge samples per pair are 2 (W&B runs: 4) and the judge cap is 512 tokens, to fit more steps in 12 h. The base model is
 Qwen3-VL-8B, not Gemma 4, so compare against this run's own step 0, not against v6.
