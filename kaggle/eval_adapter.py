@@ -61,13 +61,25 @@ class Runner:
 
     def __init__(self, base: str, adapter: Path, batch: int):
         from peft import PeftModel
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         self.processor = AutoProcessor.from_pretrained(base)
         self.tok = self.processor.tokenizer
         self.tok.padding_side = "left"
-        model = AutoModelForImageTextToText.from_pretrained(base, device_map={"": 0}, dtype=dtype)
+        # The unsloth checkpoint keeps the vision tower unquantized and lists it as "visual" in
+        # llm_int8_skip_modules; transformers 5.x matches those as name prefixes, so "visual" misses
+        # "model.visual.*" and those layers load as uninitialized 4-bit ("FP4 quantization state not initialized").
+        config = AutoConfig.from_pretrained(base)
+        qc = config.quantization_config
+        skip = list((qc.get("llm_int8_skip_modules") if isinstance(qc, dict) else qc.llm_int8_skip_modules) or [])
+        if "model.visual" not in skip:
+            skip.append("model.visual")
+            if isinstance(qc, dict):
+                qc["llm_int8_skip_modules"] = skip
+            else:
+                qc.llm_int8_skip_modules = skip
+        model = AutoModelForImageTextToText.from_pretrained(base, config=config, device_map={"": 0}, dtype=dtype)
         self.model = PeftModel.from_pretrained(model, str(adapter)).eval()
         self.batch = batch
         stops = [self.tok.eos_token_id, self.tok.convert_tokens_to_ids("<|im_end|>")]
