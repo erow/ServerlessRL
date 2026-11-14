@@ -202,7 +202,7 @@ elif GAME == "refgame":
         return dataclasses.replace(RG.RefGameConfig(), **scheme)
     RG_TRAIN, RG_VAL = rg_config("train2017"), rg_config("val2017")
     r = RG.step_rounds(RG_TRAIN, train_src, CONFIG["SEED"], "train", 0, 1)[0]
-    print("referring game:", r.image, r.box, r.meta["kinds"], "answer", "ABCD"[r.answer])
+    print("referring game:", r.image, r.box, r.meta["kinds"], "answer", RG.LETTERS[r.answer])
 else:
     # caption_game imports message_reasoning from serverless.train, which pulls in the W&B/ART client; a stub
     # is enough because thinking is off here.
