@@ -125,7 +125,7 @@ code("""
 import json, os, subprocess, sys, time
 from pathlib import Path
 
-def find(name, kind="dir", root=Path("/kaggle/input"), max_depth=4):
+def find(name, kind="dir", root=Path("/kaggle/input"), max_depth=6):
     for depth in range(max_depth + 1):
         for p in sorted(root.glob("/".join(["*"] * depth + [name]))):
             if (p.is_dir() if kind == "dir" else p.is_file()):
