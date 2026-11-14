@@ -70,6 +70,7 @@ class RefGameConfig:
     reward: str = "prob"  # "prob" = p(correct letter), "acc" = argmax is correct
 
     max_overlap: float = 0.1  # same-image distractors: IoU with the target and each other below this
+    same_gap: float = 0.0  # same-image distractors also keep this many target-sides away from the target
 
     def kinds(self) -> list[str]:
         return parse_kinds(self.distractors, self.choices - 1)
@@ -138,16 +139,25 @@ def draw_box(img: Image.Image, box: Box, width: int) -> Image.Image:
     return out
 
 
-def same_image_boxes(rng: random.Random, width: int, height: int, gt: Box, count: int, max_overlap: float) -> list[Box]:
+def same_image_boxes(rng: random.Random, width: int, height: int, gt: Box, count: int, max_overlap: float,
+                     gap: float = 0.0) -> list[Box]:
+    """Same-size regions of the target's image. With gap > 0 they must also stay clear of the target grown by
+    gap * its shorter side (a neighbouring crop shares content with the target and is a false negative); the gap
+    halves, then drops, only when the image has no room."""
     w, h = gt[2] - gt[0], gt[3] - gt[1]
-    for limit in (max_overlap, max(max_overlap, 0.25)):
-        boxes: list[Box] = []
-        for _ in range(300):
-            box = random_box(rng, width, height, w, h)
-            if all(iou(box, other) < limit for other in [gt, *boxes]):
-                boxes.append(box)
-                if len(boxes) == count:
-                    return boxes
+    for g in (gap, gap / 2, 0.0) if gap > 0 else (0.0,):
+        m = round(g * min(w, h))
+        grown = (gt[0] - m, gt[1] - m, gt[2] + m, gt[3] + m)
+        for limit in (max_overlap, max(max_overlap, 0.25)):
+            boxes: list[Box] = []
+            for _ in range(300):
+                box = random_box(rng, width, height, w, h)
+                if m and iou(box, grown) > 0:
+                    continue
+                if all(iou(box, other) < limit for other in [gt, *boxes]):
+                    boxes.append(box)
+                    if len(boxes) == count:
+                        return boxes
     raise ValueError("no room for distinct same-image regions")
 
 
@@ -158,7 +168,7 @@ def make_round(cfg: RefGameConfig, rng: random.Random, source: ImageSource) -> R
         idx, img = source.sample(rng)
         try:
             box = salient_box(rng, img, rng.uniform(*cfg.ratio), cfg.salient_candidates, cfg.min_side)
-            same = same_image_boxes(rng, img.width, img.height, box, n_same, cfg.max_overlap) if n_same else []
+            same = same_image_boxes(rng, img.width, img.height, box, n_same, cfg.max_overlap, cfg.same_gap) if n_same else []
             if cross is not None:
                 cross_patches, info = cross._distractors(rng, source, idx, img, box, box)
             else:

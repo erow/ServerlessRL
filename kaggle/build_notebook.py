@@ -101,6 +101,14 @@ ARMS = {
         VAL_EVERY=20, SAVE_EVERY=20,
         RG_SCHEME={"distractors": "same-image,oracle-cat,oracle-dist", "oracle_index": "auto", "color_select": 2}),
     ),
+    # Harder game after phase 0 (base already 83-91% with 4 crops): 8 crops, smaller targets (3-8% of the image),
+    # one far same-image region plus six retrieved look-alikes from other images (COCO-label-matched).
+    "refgame-hard": dict(game="refgame", config=dict(
+        REPO_REF="referring-game", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=64, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=20, SAVE_EVERY=20, RG_LISTENER_BATCH=4,
+        RG_SCHEME={"choices": 8, "ratio": [0.03, 0.08], "same_gap": 0.5, "color_select": 2, "oracle_index": "auto",
+                   "distractors": "same-image,oracle-cat,oracle-cat,oracle-cat,oracle-dist,oracle-dist,oracle-dist"}),
+    ),
 }
 ARM = ARMS[CONFIG_OVERRIDES.get("ARM", CONFIG["ARM"])]
 for k, v in ARM.get("config", {}).items():
