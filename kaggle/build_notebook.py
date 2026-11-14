@@ -67,6 +67,10 @@ CONFIG = dict(
     CG_MASK_RATIO=0.3, CG_IMAGES_PER_STEP=8, CG_CAPTION_SAMPLES=4, CG_JUDGE_SAMPLES=2,
     CG_CAPTION_MAX_TOKENS=320, CG_JUDGE_MAX_TOKENS=512, CG_VAL_IMAGES=32,
     CG_FOOL_WEIGHT=0.5, CG_CONTENT_WEIGHT=0.5, CG_CONTENT_METRIC="recall", CG_GATE_PENALTY=-0.5,
+    # Referring game (ARM refgame*): the policy describes a boxed region, the frozen base model (LoRA disabled)
+    # picks it among RG_SCHEME's look-alike crops; PROMPTS_PER_STEP rounds x GROUP_SIZE descriptions per step.
+    # RG_SCHEME keys are RefGameConfig fields (serverless/refgame.py); "oracle_index": "auto" builds the index.
+    RG_SCHEME={}, RG_VAL_ROUNDS=64, RG_LISTENER_BATCH=8,
 )
 CONFIG_OVERRIDES = {}
 
@@ -85,6 +89,18 @@ ARMS = {
     # v7 on Kaggle: v6 settings (mask 0.3, forger-only, thinking off) with lr 3e-5, 100 steps.
     "capgame-v7": dict(game="caption", config=dict(REPO_REF="masked-caption-game", LR=3e-5, STEPS=100,
                                                    VAL_EVERY=20, SAVE_EVERY=10)),
+    # Referring game: descriptions <= 20 words, so 64 new tokens; distractors: one same-image region and two
+    # colour/sharpness-matched regions of other images (refgame-oracle: COCO-label-matched instead).
+    "refgame": dict(game="refgame", config=dict(
+        REPO_REF="referring-game", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=64, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=20, SAVE_EVERY=20,
+        RG_SCHEME={"distractors": "same-image,random,random", "color_select": 4}),
+    ),
+    "refgame-oracle": dict(game="refgame", config=dict(
+        REPO_REF="referring-game", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=64, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=20, SAVE_EVERY=20,
+        RG_SCHEME={"distractors": "same-image,oracle-cat,oracle-dist", "oracle_index": "auto", "color_select": 2}),
+    ),
 }
 ARM = ARMS[CONFIG_OVERRIDES.get("ARM", CONFIG["ARM"])]
 for k, v in ARM.get("config", {}).items():
@@ -166,6 +182,19 @@ if GAME == "puzzles":
                                   format_reward=CONFIG["FORMAT_REWARD"])
     p = train_obj.batch(train_src, "train", 0, 1)[0]
     print(p.task, p.answer, p.text[:300])
+elif GAME == "refgame":
+    import dataclasses
+    import serverless.refgame as RG
+    def rg_config(split):
+        scheme = dict(CONFIG["RG_SCHEME"])
+        if scheme.get("oracle_index") == "auto":
+            scheme["oracle_index"] = label_index(split)
+        if isinstance(scheme.get("ratio"), list):
+            scheme["ratio"] = tuple(scheme["ratio"])
+        return dataclasses.replace(RG.RefGameConfig(), **scheme)
+    RG_TRAIN, RG_VAL = rg_config("train2017"), rg_config("val2017")
+    r = RG.step_rounds(RG_TRAIN, train_src, CONFIG["SEED"], "train", 0, 1)[0]
+    print("referring game:", r.image, r.box, r.meta["kinds"], "answer", "ABCD"[r.answer])
 else:
     # caption_game imports message_reasoning from serverless.train, which pulls in the W&B/ART client; a stub
     # is enough because thinking is off here.
@@ -499,6 +528,18 @@ def play_images(images, game, temperature=None):
     with ThreadPoolExecutor(1) as ex:
         return ex.submit(asyncio.run, go()).result()
 
+# ---- referring game: policy speaker, frozen base listener (same weights, LoRA disabled)
+def encode_content(content, images):
+    text = processor.apply_chat_template([{"role": "user", "content": content}], tokenize=False,
+                                         add_generation_prompt=True)
+    return processor(text=[text], images=images, return_tensors="pt").to("cuda")
+
+def rg_listen(cfg, rounds, descs):
+    FastVisionModel.for_inference(model)
+    with model.disable_adapter():
+        return RG.listen(cfg, model, processor, rounds, descs, device="cuda", batch=CONFIG["RG_LISTENER_BATCH"],
+                         autocast_dtype=AMP_DTYPE)
+
 # ---- checkpoints (local + optional HF Hub for resume across 12 h sessions)
 from kaggle_secrets import UserSecretsClient
 def secret(name):
@@ -576,7 +617,8 @@ start = try_resume(optimizer, scaler)
 import dataclasses
 (OUT / "run_config.json").write_text(json.dumps(
     {**CONFIG, "repo_commit": REPO_COMMIT,
-     "objective": train_obj.describe() if GAME == "puzzles" else dataclasses.asdict(CG_CFG)},
+     "objective": train_obj.describe() if GAME == "puzzles" else
+                  dataclasses.asdict(RG_TRAIN) if GAME == "refgame" else dataclasses.asdict(CG_CFG)},
     indent=1, default=str))
 
 def puzzle_step(step):
@@ -626,8 +668,54 @@ def caption_evaluate(step):
          "forger_reward": r.forgeries[0].reward, "stats": r.stats} for r in results])
     return {f"val/{k}": v for k, v in CG.mean_stats(results).items()}
 
-train_step = puzzle_step if GAME == "puzzles" else caption_step
-val_fn = evaluate if GAME == "puzzles" else caption_evaluate
+def refgame_step(step):
+    rounds = RG.step_rounds(RG_TRAIN, train_src, CONFIG["SEED"], "train", step, CONFIG["PROMPTS_PER_STEP"])
+    G = CONFIG["GROUP_SIZE"]
+    batch = []
+    for rnd in rounds:
+        inputs = encode_content(*RG.speaker_item(RG_TRAIN, rnd))
+        seqs, texts = generate(inputs, G)
+        batch.append((inputs, seqs, [RG.clean_description(t) for t in texts]))
+    scores = rg_listen(RG_TRAIN, [r for r in rounds for _ in range(G)], [d for _, _, ds in batch for d in ds])
+    rollouts, samples, lens = [], [], []
+    for i, (rnd, (inputs, seqs, descs)) in enumerate(zip(rounds, batch)):
+        sc = scores[i * G : (i + 1) * G]
+        adv = group_advantages([s["reward"] for s in sc])
+        if adv:
+            rollouts += [(inputs, s, a) for s, a in zip(seqs, adv)]
+        lens += [len(s) for s in seqs]
+        samples.append({"step": step, "image": rnd.image, "box": rnd.box, "answer": rnd.answer,
+                        "kinds": rnd.meta["kinds"], "descriptions": descs, "scores": sc})
+    append("samples.jsonl", samples)
+    stats = {f"train/{k}": statistics.mean(s[k] for s in scores) for k in ("reward", "accuracy", "p_correct", "words")}
+    stats["train/over_max_words"] = statistics.mean(s["words"] > RG_TRAIN.max_words for s in scores)
+    stats["train/completion_tokens"] = statistics.mean(lens)
+    stats["train/groups_with_signal"] = len(rollouts) / G / len(rounds)
+    return rollouts, stats
+
+def refgame_evaluate(step):
+    \"\"\"Greedy speaker (policy) on fixed val2017 rounds, judged by the frozen base listener. At step 0 also the
+    blind (no description) and colour-only floors: a speaker that only names colours should not get far.\"\"\"
+    rounds = RG.step_rounds(RG_VAL, val_src, CONFIG["SEED"], "val", 0, CONFIG["RG_VAL_ROUNDS"])
+    descs = []
+    for rnd in rounds:
+        _, texts = generate(encode_content(*RG.speaker_item(RG_VAL, rnd)), 1, greedy=True)
+        descs.append(RG.clean_description(texts[0]))
+    scores = rg_listen(RG_VAL, rounds, descs)
+    out = {f"val/{k}": statistics.mean(s[k] for s in scores) for k in ("reward", "accuracy", "p_correct", "words")}
+    rows = [{"image": r.image, "box": r.box, "answer": r.answer, "kinds": r.meta["kinds"], "description": d,
+             "score": s} for r, d, s in zip(rounds, descs, scores)]
+    if step == 0:
+        for name, ds in (("blind", [""] * len(rounds)),
+                         ("colour", [RG.colour_description(r.candidates[r.answer]) for r in rounds])):
+            sc = rg_listen(RG_VAL, rounds, ds)
+            out[f"val/{name}_accuracy"] = statistics.mean(s["accuracy"] for s in sc)
+            out[f"val/{name}_p_correct"] = statistics.mean(s["p_correct"] for s in sc)
+    append(f"val_rounds_step{step:05d}.jsonl", rows)
+    return out
+
+train_step = {"puzzles": puzzle_step, "caption": caption_step, "refgame": refgame_step}[GAME]
+val_fn = {"puzzles": evaluate, "caption": caption_evaluate, "refgame": refgame_evaluate}[GAME]
 
 t0 = time.time()
 if start == 0 and CONFIG["VAL_EVERY"] and CONFIG["VAL_AT_START"]:
