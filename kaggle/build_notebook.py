@@ -58,11 +58,14 @@ CONFIG = dict(
     RESUME=True,                     # resume ARM from HF_REPO/<ARM>/latest if present
     WANDB_PROJECT="sslvlm-kaggle",   # used only if Kaggle secret WANDB_API_KEY exists
     SEED=0,
-    GEN_BATCH=16,                    # sequences generated together (caption game)
+    GEN_BATCH=16,                    # sequences generated together on cuda:0 (caption game)
+    GEN_BATCH_GPU1=24,               # same on the frozen copy on cuda:1 (no training state there)
+    FROZEN_ON_GPU1=True,             # caption game: frozen captioner/judge on a second model copy on cuda:1
     # Masked caption game (ARM capgame-*): forger-only against a frozen captioner and judge (the base model,
     # i.e. LoRA disabled), as in runs v4-v7 on W&B Serverless.
-    CG_MASK_RATIO=0.3, CG_IMAGES_PER_STEP=8, CG_CAPTION_SAMPLES=4, CG_JUDGE_SAMPLES=4,
-    CG_CAPTION_MAX_TOKENS=320, CG_JUDGE_MAX_TOKENS=768, CG_VAL_IMAGES=32,
+    # CG_JUDGE_SAMPLES 2 (W&B runs used 4) and judge cap 512 (768) halve the judge cost on a T4.
+    CG_MASK_RATIO=0.3, CG_IMAGES_PER_STEP=8, CG_CAPTION_SAMPLES=4, CG_JUDGE_SAMPLES=2,
+    CG_CAPTION_MAX_TOKENS=320, CG_JUDGE_MAX_TOKENS=512, CG_VAL_IMAGES=32,
     CG_FOOL_WEIGHT=0.5, CG_CONTENT_WEIGHT=0.5, CG_CONTENT_METRIC="recall", CG_GATE_PENALTY=-0.5,
 )
 CONFIG_OVERRIDES = {}
@@ -256,8 +259,8 @@ def completion_logprob(inputs, comp):
     \"\"\"Sum of log p(completion | prompt, images) under the current policy, with gradients.\"\"\"
     # generate() runs under torch.inference_mode, and autograd refuses to save inference tensors for backward
     # (gather's index, the vision inputs): clone them into normal tensors first.
-    comp = comp.clone()
     inputs = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in inputs.items()}
+    comp = comp.clone().to(inputs["input_ids"].device)
     plen = inputs["input_ids"].shape[1]
     ids = torch.cat([inputs["input_ids"][0], comp]).unsqueeze(0)
     extra = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
@@ -346,44 +349,80 @@ def encode_messages(messages):
     text, images = chat_inputs(messages)
     return processor(text=[text], images=images, return_tensors="pt").to("cuda")
 
-@torch.no_grad()
-def generate_many(prompts, n, max_new_tokens, temperature, adapter=True):
-    \"\"\"n samples for each prompt (list of messages), batched with left padding. Returns [[(ids, text)] * n].\"\"\"
-    FastVisionModel.for_inference(model)
-    TOK.padding_side = "left"
+# A second copy of the base model on the second GPU serves the frozen roles (captioner, judge) in parallel with
+# the policy on cuda:0. Same 4-bit weights as the policy with its LoRA disabled. Falls back to the policy model
+# with the adapter disabled when there is one GPU or the copy fails.
+import threading
+POLICY_LOCK = threading.Lock()
+FROZEN = None
+if GAME == "caption" and CONFIG["FROZEN_ON_GPU1"] and torch.cuda.device_count() > 1:
+    try:
+        from transformers import AutoModelForImageTextToText
+        FROZEN = AutoModelForImageTextToText.from_pretrained(
+            CONFIG["MODEL_NAME"], device_map={"": 1}, dtype=torch.float16).eval()
+        print("frozen captioner/judge model on cuda:1")
+    except Exception as e:
+        print("no frozen copy on cuda:1, using the policy with LoRA disabled:", repr(e)[:300])
+        FROZEN = None
+
+def _sample_kw(n, max_new_tokens, temperature):
     greedy = temperature == 0
     k = 1 if greedy else n
     kw = dict(max_new_tokens=max_new_tokens, pad_token_id=PAD_ID, use_cache=True)
     kw.update(do_sample=False) if greedy else kw.update(do_sample=True, temperature=temperature, top_p=CONFIG["TOP_P"])
-    per = max(1, CONFIG["GEN_BATCH"] // k)
+    return k, kw
+
+def _generate_on(m, device, prompts, n, max_new_tokens, temperature, batch):
+    \"\"\"n samples for each prompt (list of messages) on model m, batched with left padding.\"\"\"
+    k, kw = _sample_kw(n, max_new_tokens, temperature)
+    per = max(1, batch // k)
     results = []
-    with (contextlib.nullcontext() if adapter else model.disable_adapter()):
-        for i in range(0, len(prompts), per):
-            chunk = [chat_inputs(m) for m in prompts[i : i + per]]
-            try:
-                inputs = processor(text=[t for t, _ in chunk], images=[im for _, ims in chunk for im in ims],
-                                   padding=True, return_tensors="pt").to("cuda")
-                out = model.generate(**inputs, num_return_sequences=k, **kw)
-                plen = inputs["input_ids"].shape[1]
-                rows = [[trim(s[plen:]) for s in out[j * k : (j + 1) * k]] for j in range(len(chunk))]
-            except Exception as e:  # fall back to one prompt and one sample at a time
-                print("batched generate failed, looping:", repr(e)[:200])
-                rows = []
-                for text, ims in chunk:
-                    inp = processor(text=[text], images=ims, return_tensors="pt").to("cuda")
-                    pl = inp["input_ids"].shape[1]
-                    rows.append([trim(model.generate(**inp, **kw)[0, pl:]) for _ in range(k)])
-            for seqs in rows:
-                seqs = seqs * (n // k)
-                results.append([(s, TOK.decode(s, skip_special_tokens=True)) for s in seqs])
+    for i in range(0, len(prompts), per):
+        chunk = [chat_inputs(p) for p in prompts[i : i + per]]
+        try:
+            inputs = processor(text=[t for t, _ in chunk], images=[im for _, ims in chunk for im in ims],
+                               padding=True, return_tensors="pt").to(device)
+            out = m.generate(**inputs, num_return_sequences=k, **kw)
+            plen = inputs["input_ids"].shape[1]
+            rows = [[trim(s[plen:].cpu()) for s in out[j * k : (j + 1) * k]] for j in range(len(chunk))]
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as e:  # fall back to one prompt and one sample at a time
+            print("batched generate failed, looping:", repr(e)[:200])
+            rows = []
+            for text, ims in chunk:
+                inp = processor(text=[text], images=ims, return_tensors="pt").to(device)
+                pl = inp["input_ids"].shape[1]
+                rows.append([trim(m.generate(**inp, **kw)[0, pl:].cpu()) for _ in range(k)])
+        for seqs in rows:
+            seqs = seqs * (n // k)
+            results.append([(s, TOK.decode(s, skip_special_tokens=True)) for s in seqs])
     return results
 
+@torch.no_grad()
+def generate_many(prompts, n, max_new_tokens, temperature, adapter=True, gpu1=False):
+    \"\"\"Returns [[(ids, text)] * n] per prompt. adapter=False samples the frozen base model; gpu1=True runs it on
+    the cuda:1 copy when there is one.\"\"\"
+    global FROZEN
+    TOK.padding_side = "left"
+    if gpu1 and not adapter and FROZEN is not None:
+        try:
+            return _generate_on(FROZEN, "cuda:1", prompts, n, max_new_tokens, temperature, CONFIG["GEN_BATCH_GPU1"])
+        except Exception as e:
+            print("cuda:1 generation failed; frozen roles move to the policy with LoRA disabled:", repr(e)[:300])
+            FROZEN = None
+    with POLICY_LOCK:
+        FastVisionModel.for_inference(model)
+        with (contextlib.nullcontext() if adapter else model.disable_adapter()):
+            return _generate_on(model, "cuda", prompts, n, max_new_tokens, temperature, CONFIG["GEN_BATCH"])
+
 class LocalBackend:
-    \"\"\"`complete(messages, temperature, role)` for caption_game.play, run on the local model.
+    \"\"\"`complete(messages, temperature, role)` for caption_game.play, run on the local model(s).
 
     Calls made while play() coroutines are gathered are collected and generated together; identical messages
     (the G samples of one prompt) become one prompt with num_return_sequences=G. Roles in `trained` use the
-    LoRA policy, every other role the frozen base model (LoRA disabled).\"\"\"
+    LoRA policy (cuda:0), every other role the frozen base model. With a cuda:1 copy, the two GPUs work in
+    parallel: frozen work goes to cuda:1, and when there is no policy work in a round it is split across both.\"\"\"
 
     def __init__(self, trained=("forger",)):
         self.trained, self.pending, self.flusher = set(trained), [], None
@@ -402,18 +441,48 @@ class LocalBackend:
         groups = {}
         for messages, temp, role, fut in batch:
             groups.setdefault((role, temp), {}).setdefault(id(messages), (messages, []))[1].append(fut)
+        # jobs: (items, n, limit, temp, adapter, gpu1)
+        jobs = []
         for (role, temp), prompts in groups.items():
             by_n = {}
             for messages, futs in prompts.values():
                 by_n.setdefault(len(futs), []).append((messages, futs))
             limit = CONFIG["CG_JUDGE_MAX_TOKENS"] if role == "judge" else CONFIG["CG_CAPTION_MAX_TOKENS"]
             for n, items in by_n.items():
+                jobs.append([items, n, limit, temp, role in self.trained, False])
+        policy_busy = any(j[4] for j in jobs)
+        split = []
+        for j in jobs:
+            if j[4] or FROZEN is None:
+                split.append(j)
+            elif policy_busy:
+                j[5] = True; split.append(j)
+            else:  # only frozen work this round: give cuda:1 about 60% (cuda:0 also does LoRA bookkeeping)
+                cut = max(1, round(0.6 * len(j[0])))
+                split.append([j[0][:cut], *j[1:5], True])
+                if j[0][cut:]:
+                    split.append([j[0][cut:], *j[1:5], False])
+        lanes = {True: [j for j in split if j[5]], False: [j for j in split if not j[5]]}
+
+        def run(lane):
+            for items, n, limit, temp, adapter, gpu1 in lane:
                 try:
-                    outs = generate_many([m for m, _ in items], n, limit, temp, adapter=role in self.trained)
+                    outs = generate_many([m for m, _ in items], n, limit, temp, adapter=adapter, gpu1=gpu1)
                 except Exception as e:
+                    outs = e
+                yield items, outs
+
+        def drain(lane):
+            return list(run(lane))
+
+        with ThreadPoolExecutor(2) as ex:
+            done = [f.result() for f in [ex.submit(drain, lanes[True]), ex.submit(drain, lanes[False])]]
+        for lane in done:
+            for items, outs in lane:
+                if isinstance(outs, Exception):
                     for _, futs in items:
                         for f in futs:
-                            f.set_exception(e)
+                            f.set_exception(outs)
                     continue
                 for (_, futs), samples in zip(items, outs):
                     for f, (ids, text) in zip(futs, samples):
@@ -501,7 +570,8 @@ def append(name, rows):
         f.writelines(json.dumps(r, default=str) + "\\n" for r in rows)
 
 optimizer = torch.optim.AdamW(trainable, lr=CONFIG["LR"], betas=(0.9, 0.99), weight_decay=0.0)
-scaler = torch.amp.GradScaler("cuda", enabled=AMP_DTYPE == torch.float16)
+# init_scale 2**10 (default 2**16): fewer skipped (inf/nan) updates while the scale settles; each step is costly.
+scaler = torch.amp.GradScaler("cuda", init_scale=2.0 ** 10, enabled=AMP_DTYPE == torch.float16)
 start = try_resume(optimizer, scaler)
 import dataclasses
 (OUT / "run_config.json").write_text(json.dumps(
