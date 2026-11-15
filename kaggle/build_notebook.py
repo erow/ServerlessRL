@@ -143,6 +143,26 @@ def find(name, kind="dir", root=Path("/kaggle/input"), max_depth=6):
                 return p
     raise FileNotFoundError(f"{name} not found under {root}; attach a COCO 2017 dataset")
 
+def wait_for_coco(timeout_s=1800, poll_s=30):
+    \"\"\"Kaggle can start the notebook while attached datasets are still being mounted (seen with two datasets:
+    30k of 118k train images and no annotations). Wait until the annotations exist and the train image count is complete;
+    COCO 2017 train has 118,287 images.\"\"\"
+    t0 = time.time()
+    while True:
+        try:
+            train = find("train2017")
+            ann = find("instances_train2017.json", "file")
+            n = sum(1 for _ in os.scandir(train))
+        except FileNotFoundError:
+            n, ann = -1, None
+        if ann is not None and n >= 118287:
+            return
+        if time.time() - t0 > timeout_s:
+            raise RuntimeError(f"COCO mount incomplete after {timeout_s}s: {n} train images, annotations={ann}")
+        print(f"waiting for the COCO mount: {n} train images, annotations={'yes' if ann else 'no'}")
+        time.sleep(poll_s)
+
+wait_for_coco()
 TRAIN_DIR, VAL_DIR = find("train2017"), find("val2017")
 print("COCO:", TRAIN_DIR, VAL_DIR)
 
