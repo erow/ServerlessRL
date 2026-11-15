@@ -56,6 +56,8 @@ CONFIG = dict(
     TIME_BUDGET_H=11.0,              # stop and save before Kaggle's 12 h limit
     HF_REPO="",                      # e.g. "you/sslvlm-kaggle"; needs Kaggle secret HF_TOKEN; enables resume
     RESUME=True,                     # resume ARM from HF_REPO/<ARM>/latest if present
+    INIT_FROM="",                    # or: name of an attached Kaggle dataset holding a saved latest/ (adapter +
+                                     # trainer.pt); training continues from its step (run.sh DATASETS=user/slug)
     WANDB_PROJECT="sslvlm-kaggle",   # used only if Kaggle secret WANDB_API_KEY exists
     SEED=0,
     GEN_BATCH=16,                    # sequences generated together on cuda:0 (caption game)
@@ -107,6 +109,15 @@ ARMS = {
         REPO_REF="referring-game", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=64, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
         VAL_EVERY=20, SAVE_EVERY=20, RG_LISTENER_BATCH=4,
         RG_SCHEME={"choices": 8, "ratio": [0.03, 0.08], "same_gap": 0.5, "color_select": 2, "oracle_index": "auto",
+                   "distractors": "same-image,oracle-cat,oracle-cat,oracle-cat,oracle-dist,oracle-dist,oracle-dist"}),
+    ),
+    # refgame-hard with a 15-word cap (descriptions grew 12.9 -> 15.6 words by step 114); meant to continue the
+    # refgame-hard checkpoint: INIT_FROM=<dataset with its latest/>, run.sh DATASETS=<user>/<slug>.
+    "refgame-hard15": dict(game="refgame", config=dict(
+        REPO_REF="referring-game", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=64, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=25, SAVE_EVERY=20, RG_LISTENER_BATCH=4, RG_VAL_ROUNDS=128,
+        RG_SCHEME={"choices": 8, "ratio": [0.03, 0.08], "same_gap": 0.5, "color_select": 2, "oracle_index": "auto",
+                   "max_words": 15,
                    "distractors": "same-image,oracle-cat,oracle-cat,oracle-cat,oracle-dist,oracle-dist,oracle-dist"}),
     ),
 }
@@ -574,12 +585,24 @@ def save(step, optimizer, scaler):
                           commit_message=f"{CONFIG['ARM']} step {step}")
     print(f"saved step {step}")
 
+def load_checkpoint(ck, optimizer, scaler):
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+    set_peft_model_state_dict(model, load_file(ck / "adapter_model.safetensors"))
+    state = torch.load(ck / "trainer.pt", map_location="cuda", weights_only=False)
+    optimizer.load_state_dict(state["optimizer"]); scaler.load_state_dict(state["scaler"])
+    print(f"resumed {CONFIG['ARM']} from {ck} at step {state['step']}")
+    return state["step"]
+
 def try_resume(optimizer, scaler):
+    if CONFIG["INIT_FROM"]:
+        hits = sorted(p.parent for p in Path("/kaggle/input").rglob("trainer.pt") if CONFIG["INIT_FROM"] in str(p))
+        if not hits:
+            raise FileNotFoundError(f"INIT_FROM={CONFIG['INIT_FROM']!r}: no trainer.pt under /kaggle/input")
+        return load_checkpoint(hits[0], optimizer, scaler)
     if not (CONFIG["RESUME"] and HF_TOKEN):
         return 0
     from huggingface_hub import snapshot_download
-    from peft import set_peft_model_state_dict
-    from safetensors.torch import load_file
     try:
         d = Path(snapshot_download(CONFIG["HF_REPO"], token=HF_TOKEN, allow_patterns=[f"{CONFIG['ARM']}/latest/*"]))
     except Exception as e:
@@ -587,11 +610,7 @@ def try_resume(optimizer, scaler):
     ck = d / CONFIG["ARM"] / "latest"
     if not (ck / "trainer.pt").exists():
         return 0
-    set_peft_model_state_dict(model, load_file(ck / "adapter_model.safetensors"))
-    state = torch.load(ck / "trainer.pt", map_location="cuda", weights_only=False)
-    optimizer.load_state_dict(state["optimizer"]); scaler.load_state_dict(state["scaler"])
-    print(f"resumed {CONFIG['ARM']} from step {state['step']}")
-    return state["step"]
+    return load_checkpoint(ck, optimizer, scaler)
 """)
 
 code("""
