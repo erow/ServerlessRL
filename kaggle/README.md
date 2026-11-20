@@ -41,3 +41,12 @@ step are generated together (identical prompts as one prompt with `num_return_se
 (Kaggle T4 x2) a second copy of the base model on cuda:1 serves the frozen roles in parallel with the policy;
 judge samples per pair are 2 (W&B runs: 4) and the judge cap is 512 tokens, to fit more steps in 12 h. The base model is
 Qwen3-VL-8B, not Gemma 4, so compare against this run's own step 0, not against v6.
+
+Referring game (`refgame`, `refgame-oracle`): clones `referring-game` and uses `serverless/refgame.py`. The policy
+sees an image with a red box and describes the region in at most 20 words; the frozen base model (LoRA disabled)
+sees only 4 crops (the region and 3 look-alikes, no positions) and the description, and its probability of the
+right letter, averaged over two candidate orders, is the reward (minus 0.05 per word beyond 20). There is no
+recall or content term, so a longer or invented description cannot pay. `refgame`: one same-image region and two
+colour/sharpness-matched regions of other images; `refgame-oracle`: COCO-label-matched regions. The step-0 eval
+also reports blind (no description) and colour-only listener floors. Base-model checks without training:
+`python -m serverless.refgame phase0 --images <val2017> --out-dir <dir> --scheme name='{...}'`.

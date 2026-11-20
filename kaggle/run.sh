@@ -10,7 +10,8 @@
 # Each arm gets its own kernel (sslvlm-<arm>), so arms can run side by side within Kaggle's GPU session limit.
 # Needs the kaggle CLI with an API token in ~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY.
 # Optional Kaggle secrets (set in the notebook's Add-ons > Secrets): HF_TOKEN, WANDB_API_KEY.
-# Env: ACCELERATOR (default NvidiaTeslaT4), POLL (seconds, default 120), NO_WAIT=1 to push and exit.
+# Env: ACCELERATOR (default NvidiaTeslaT4), POLL (seconds, default 120), NO_WAIT=1 to push and exit,
+# DATASETS=user/slug[,...] to attach more Kaggle datasets (e.g. a checkpoint for INIT_FROM).
 set -euo pipefail
 [[ $# -ge 1 ]] || { sed -n 2,14p "$0"; exit 1; }
 KUSER=$1; ARM=${2:-A-spatial}; shift $(( $# >= 2 ? 2 : 1 ))
@@ -48,6 +49,16 @@ json.dump(nb, open(dst, "w"), indent=1)
 print("overrides:", over)
 PY
 sed -e "s/KAGGLE_USERNAME/$KUSER/" -e "s/KERNEL_SLUG/$SLUG/g" "$HERE/kernel-metadata.json" > "$BUILD/kernel-metadata.json"
+if [[ -n ${DATASETS:-} ]]; then  # extra Kaggle datasets to attach, comma-separated user/slug (e.g. a checkpoint)
+  python3 - "$BUILD/kernel-metadata.json" "$DATASETS" <<'PY'
+import json, sys
+path, extra = sys.argv[1:]
+meta = json.load(open(path))
+meta["dataset_sources"] += [d.strip() for d in extra.split(",") if d.strip()]
+json.dump(meta, open(path, "w"), indent=2)
+print("datasets:", meta["dataset_sources"])
+PY
+fi
 
 ACC_ARGS=()
 if kaggle kernels push --help 2>&1 | grep -q -- --accelerator; then

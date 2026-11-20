@@ -56,6 +56,8 @@ CONFIG = dict(
     TIME_BUDGET_H=11.0,              # stop and save before Kaggle's 12 h limit
     HF_REPO="",                      # e.g. "you/sslvlm-kaggle"; needs Kaggle secret HF_TOKEN; enables resume
     RESUME=True,                     # resume ARM from HF_REPO/<ARM>/latest if present
+    INIT_FROM="",                    # or: name of an attached Kaggle dataset holding a saved latest/ (adapter +
+                                     # trainer.pt); training continues from its step (run.sh DATASETS=user/slug)
     WANDB_PROJECT="sslvlm-kaggle",   # used only if Kaggle secret WANDB_API_KEY exists
     SEED=0,
     GEN_BATCH=16,                    # sequences generated together on cuda:0 (caption game)
@@ -67,6 +69,10 @@ CONFIG = dict(
     CG_MASK_RATIO=0.3, CG_IMAGES_PER_STEP=8, CG_CAPTION_SAMPLES=4, CG_JUDGE_SAMPLES=2,
     CG_CAPTION_MAX_TOKENS=320, CG_JUDGE_MAX_TOKENS=512, CG_VAL_IMAGES=32,
     CG_FOOL_WEIGHT=0.5, CG_CONTENT_WEIGHT=0.5, CG_CONTENT_METRIC="recall", CG_GATE_PENALTY=-0.5,
+    # Referring game (ARM refgame*): the policy describes a boxed region, the frozen base model (LoRA disabled)
+    # picks it among RG_SCHEME's look-alike crops; PROMPTS_PER_STEP rounds x GROUP_SIZE descriptions per step.
+    # RG_SCHEME keys are RefGameConfig fields (serverless/refgame.py); "oracle_index": "auto" builds the index.
+    RG_SCHEME={}, RG_VAL_ROUNDS=64, RG_LISTENER_BATCH=8,
 )
 CONFIG_OVERRIDES = {}
 
@@ -85,6 +91,35 @@ ARMS = {
     # v7 on Kaggle: v6 settings (mask 0.3, forger-only, thinking off) with lr 3e-5, 100 steps.
     "capgame-v7": dict(game="caption", config=dict(REPO_REF="masked-caption-game", LR=3e-5, STEPS=100,
                                                    VAL_EVERY=20, SAVE_EVERY=10)),
+    # Referring game: descriptions <= 20 words, so 64 new tokens; distractors: one same-image region and two
+    # colour/sharpness-matched regions of other images (refgame-oracle: COCO-label-matched instead).
+    "refgame": dict(game="refgame", config=dict(
+        REPO_REF="referring-game", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=64, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=20, SAVE_EVERY=20,
+        RG_SCHEME={"distractors": "same-image,random,random", "color_select": 4}),
+    ),
+    "refgame-oracle": dict(game="refgame", config=dict(
+        REPO_REF="referring-game", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=64, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=20, SAVE_EVERY=20,
+        RG_SCHEME={"distractors": "same-image,oracle-cat,oracle-dist", "oracle_index": "auto", "color_select": 2}),
+    ),
+    # Harder game after phase 0 (base already 83-91% with 4 crops): 8 crops, smaller targets (3-8% of the image),
+    # one far same-image region plus six retrieved look-alikes from other images (COCO-label-matched).
+    "refgame-hard": dict(game="refgame", config=dict(
+        REPO_REF="referring-game", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=64, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=20, SAVE_EVERY=20, RG_LISTENER_BATCH=4,
+        RG_SCHEME={"choices": 8, "ratio": [0.03, 0.08], "same_gap": 0.5, "color_select": 2, "oracle_index": "auto",
+                   "distractors": "same-image,oracle-cat,oracle-cat,oracle-cat,oracle-dist,oracle-dist,oracle-dist"}),
+    ),
+    # refgame-hard with a 15-word cap (descriptions grew 12.9 -> 15.6 words by step 114); meant to continue the
+    # refgame-hard checkpoint: INIT_FROM=<dataset with its latest/>, run.sh DATASETS=<user>/<slug>.
+    "refgame-hard15": dict(game="refgame", config=dict(
+        REPO_REF="referring-game", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=64, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=25, SAVE_EVERY=20, RG_LISTENER_BATCH=4, RG_VAL_ROUNDS=128,
+        RG_SCHEME={"choices": 8, "ratio": [0.03, 0.08], "same_gap": 0.5, "color_select": 2, "oracle_index": "auto",
+                   "max_words": 15,
+                   "distractors": "same-image,oracle-cat,oracle-cat,oracle-cat,oracle-dist,oracle-dist,oracle-dist"}),
+    ),
 }
 ARM = ARMS[CONFIG_OVERRIDES.get("ARM", CONFIG["ARM"])]
 for k, v in ARM.get("config", {}).items():
@@ -101,13 +136,33 @@ code("""
 import json, os, subprocess, sys, time
 from pathlib import Path
 
-def find(name, kind="dir", root=Path("/kaggle/input"), max_depth=4):
+def find(name, kind="dir", root=Path("/kaggle/input"), max_depth=6):
     for depth in range(max_depth + 1):
         for p in sorted(root.glob("/".join(["*"] * depth + [name]))):
             if (p.is_dir() if kind == "dir" else p.is_file()):
                 return p
     raise FileNotFoundError(f"{name} not found under {root}; attach a COCO 2017 dataset")
 
+def wait_for_coco(timeout_s=1800, poll_s=30):
+    \"\"\"Kaggle can start the notebook while attached datasets are still being mounted (seen with two datasets:
+    30k of 118k train images and no annotations). Wait until the annotations exist and the train image count is complete;
+    COCO 2017 train has 118,287 images.\"\"\"
+    t0 = time.time()
+    while True:
+        try:
+            train = find("train2017")
+            ann = find("instances_train2017.json", "file")
+            n = sum(1 for _ in os.scandir(train))
+        except FileNotFoundError:
+            n, ann = -1, None
+        if ann is not None and n >= 118287:
+            return
+        if time.time() - t0 > timeout_s:
+            raise RuntimeError(f"COCO mount incomplete after {timeout_s}s: {n} train images, annotations={ann}")
+        print(f"waiting for the COCO mount: {n} train images, annotations={'yes' if ann else 'no'}")
+        time.sleep(poll_s)
+
+wait_for_coco()
 TRAIN_DIR, VAL_DIR = find("train2017"), find("val2017")
 print("COCO:", TRAIN_DIR, VAL_DIR)
 
@@ -166,6 +221,19 @@ if GAME == "puzzles":
                                   format_reward=CONFIG["FORMAT_REWARD"])
     p = train_obj.batch(train_src, "train", 0, 1)[0]
     print(p.task, p.answer, p.text[:300])
+elif GAME == "refgame":
+    import dataclasses
+    import serverless.refgame as RG
+    def rg_config(split):
+        scheme = dict(CONFIG["RG_SCHEME"])
+        if scheme.get("oracle_index") == "auto":
+            scheme["oracle_index"] = label_index(split)
+        if isinstance(scheme.get("ratio"), list):
+            scheme["ratio"] = tuple(scheme["ratio"])
+        return dataclasses.replace(RG.RefGameConfig(), **scheme)
+    RG_TRAIN, RG_VAL = rg_config("train2017"), rg_config("val2017")
+    r = RG.step_rounds(RG_TRAIN, train_src, CONFIG["SEED"], "train", 0, 1)[0]
+    print("referring game:", r.image, r.box, r.meta["kinds"], "answer", RG.LETTERS[r.answer])
 else:
     # caption_game imports message_reasoning from serverless.train, which pulls in the W&B/ART client; a stub
     # is enough because thinking is off here.
@@ -499,6 +567,18 @@ def play_images(images, game, temperature=None):
     with ThreadPoolExecutor(1) as ex:
         return ex.submit(asyncio.run, go()).result()
 
+# ---- referring game: policy speaker, frozen base listener (same weights, LoRA disabled)
+def encode_content(content, images):
+    text = processor.apply_chat_template([{"role": "user", "content": content}], tokenize=False,
+                                         add_generation_prompt=True)
+    return processor(text=[text], images=images, return_tensors="pt").to("cuda")
+
+def rg_listen(cfg, rounds, descs):
+    FastVisionModel.for_inference(model)
+    with model.disable_adapter():
+        return RG.listen(cfg, model, processor, rounds, descs, device="cuda", batch=CONFIG["RG_LISTENER_BATCH"],
+                         autocast_dtype=AMP_DTYPE)
+
 # ---- checkpoints (local + optional HF Hub for resume across 12 h sessions)
 from kaggle_secrets import UserSecretsClient
 def secret(name):
@@ -525,12 +605,24 @@ def save(step, optimizer, scaler):
                           commit_message=f"{CONFIG['ARM']} step {step}")
     print(f"saved step {step}")
 
+def load_checkpoint(ck, optimizer, scaler):
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+    set_peft_model_state_dict(model, load_file(ck / "adapter_model.safetensors"))
+    state = torch.load(ck / "trainer.pt", map_location="cuda", weights_only=False)
+    optimizer.load_state_dict(state["optimizer"]); scaler.load_state_dict(state["scaler"])
+    print(f"resumed {CONFIG['ARM']} from {ck} at step {state['step']}")
+    return state["step"]
+
 def try_resume(optimizer, scaler):
+    if CONFIG["INIT_FROM"]:
+        hits = sorted(p.parent for p in Path("/kaggle/input").rglob("trainer.pt") if CONFIG["INIT_FROM"] in str(p))
+        if not hits:
+            raise FileNotFoundError(f"INIT_FROM={CONFIG['INIT_FROM']!r}: no trainer.pt under /kaggle/input")
+        return load_checkpoint(hits[0], optimizer, scaler)
     if not (CONFIG["RESUME"] and HF_TOKEN):
         return 0
     from huggingface_hub import snapshot_download
-    from peft import set_peft_model_state_dict
-    from safetensors.torch import load_file
     try:
         d = Path(snapshot_download(CONFIG["HF_REPO"], token=HF_TOKEN, allow_patterns=[f"{CONFIG['ARM']}/latest/*"]))
     except Exception as e:
@@ -538,11 +630,7 @@ def try_resume(optimizer, scaler):
     ck = d / CONFIG["ARM"] / "latest"
     if not (ck / "trainer.pt").exists():
         return 0
-    set_peft_model_state_dict(model, load_file(ck / "adapter_model.safetensors"))
-    state = torch.load(ck / "trainer.pt", map_location="cuda", weights_only=False)
-    optimizer.load_state_dict(state["optimizer"]); scaler.load_state_dict(state["scaler"])
-    print(f"resumed {CONFIG['ARM']} from step {state['step']}")
-    return state["step"]
+    return load_checkpoint(ck, optimizer, scaler)
 """)
 
 code("""
@@ -576,7 +664,8 @@ start = try_resume(optimizer, scaler)
 import dataclasses
 (OUT / "run_config.json").write_text(json.dumps(
     {**CONFIG, "repo_commit": REPO_COMMIT,
-     "objective": train_obj.describe() if GAME == "puzzles" else dataclasses.asdict(CG_CFG)},
+     "objective": train_obj.describe() if GAME == "puzzles" else
+                  dataclasses.asdict(RG_TRAIN) if GAME == "refgame" else dataclasses.asdict(CG_CFG)},
     indent=1, default=str))
 
 def puzzle_step(step):
@@ -626,8 +715,54 @@ def caption_evaluate(step):
          "forger_reward": r.forgeries[0].reward, "stats": r.stats} for r in results])
     return {f"val/{k}": v for k, v in CG.mean_stats(results).items()}
 
-train_step = puzzle_step if GAME == "puzzles" else caption_step
-val_fn = evaluate if GAME == "puzzles" else caption_evaluate
+def refgame_step(step):
+    rounds = RG.step_rounds(RG_TRAIN, train_src, CONFIG["SEED"], "train", step, CONFIG["PROMPTS_PER_STEP"])
+    G = CONFIG["GROUP_SIZE"]
+    batch = []
+    for rnd in rounds:
+        inputs = encode_content(*RG.speaker_item(RG_TRAIN, rnd))
+        seqs, texts = generate(inputs, G)
+        batch.append((inputs, seqs, [RG.clean_description(t) for t in texts]))
+    scores = rg_listen(RG_TRAIN, [r for r in rounds for _ in range(G)], [d for _, _, ds in batch for d in ds])
+    rollouts, samples, lens = [], [], []
+    for i, (rnd, (inputs, seqs, descs)) in enumerate(zip(rounds, batch)):
+        sc = scores[i * G : (i + 1) * G]
+        adv = group_advantages([s["reward"] for s in sc])
+        if adv:
+            rollouts += [(inputs, s, a) for s, a in zip(seqs, adv)]
+        lens += [len(s) for s in seqs]
+        samples.append({"step": step, "image": rnd.image, "box": rnd.box, "answer": rnd.answer,
+                        "kinds": rnd.meta["kinds"], "descriptions": descs, "scores": sc})
+    append("samples.jsonl", samples)
+    stats = {f"train/{k}": statistics.mean(s[k] for s in scores) for k in ("reward", "accuracy", "p_correct", "words")}
+    stats["train/over_max_words"] = statistics.mean(s["words"] > RG_TRAIN.max_words for s in scores)
+    stats["train/completion_tokens"] = statistics.mean(lens)
+    stats["train/groups_with_signal"] = len(rollouts) / G / len(rounds)
+    return rollouts, stats
+
+def refgame_evaluate(step):
+    \"\"\"Greedy speaker (policy) on fixed val2017 rounds, judged by the frozen base listener. At step 0 also the
+    blind (no description) and colour-only floors: a speaker that only names colours should not get far.\"\"\"
+    rounds = RG.step_rounds(RG_VAL, val_src, CONFIG["SEED"], "val", 0, CONFIG["RG_VAL_ROUNDS"])
+    descs = []
+    for rnd in rounds:
+        _, texts = generate(encode_content(*RG.speaker_item(RG_VAL, rnd)), 1, greedy=True)
+        descs.append(RG.clean_description(texts[0]))
+    scores = rg_listen(RG_VAL, rounds, descs)
+    out = {f"val/{k}": statistics.mean(s[k] for s in scores) for k in ("reward", "accuracy", "p_correct", "words")}
+    rows = [{"image": r.image, "box": r.box, "answer": r.answer, "kinds": r.meta["kinds"], "description": d,
+             "score": s} for r, d, s in zip(rounds, descs, scores)]
+    if step == 0:
+        for name, ds in (("blind", [""] * len(rounds)),
+                         ("colour", [RG.colour_description(r.candidates[r.answer]) for r in rounds])):
+            sc = rg_listen(RG_VAL, rounds, ds)
+            out[f"val/{name}_accuracy"] = statistics.mean(s["accuracy"] for s in sc)
+            out[f"val/{name}_p_correct"] = statistics.mean(s["p_correct"] for s in sc)
+    append(f"val_rounds_step{step:05d}.jsonl", rows)
+    return out
+
+train_step = {"puzzles": puzzle_step, "caption": caption_step, "refgame": refgame_step}[GAME]
+val_fn = {"puzzles": evaluate, "caption": caption_evaluate, "refgame": refgame_evaluate}[GAME]
 
 t0 = time.time()
 if start == 0 and CONFIG["VAL_EVERY"] and CONFIG["VAL_AT_START"]:
