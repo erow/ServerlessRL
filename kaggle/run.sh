@@ -11,18 +11,19 @@
 # Needs the kaggle CLI with an API token in ~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY.
 # Optional Kaggle secrets (set in the notebook's Add-ons > Secrets): HF_TOKEN, WANDB_API_KEY.
 # Env: ACCELERATOR (default NvidiaTeslaT4), POLL (seconds, default 120), NO_WAIT=1 to push and exit,
-# DATASETS=user/slug[,...] to attach more Kaggle datasets (e.g. a checkpoint for INIT_FROM).
+# DATASETS=user/slug[,...] to attach more Kaggle datasets (e.g. a checkpoint for INIT_FROM),
+# NOTEBOOK=script_kaggle.ipynb to run a script arm (no training, e.g. l2g-phase0) instead of the GRPO notebook.
 set -euo pipefail
 [[ $# -ge 1 ]] || { sed -n 2,14p "$0"; exit 1; }
 KUSER=$1; ARM=${2:-A-spatial}; shift $(( $# >= 2 ? 2 : 1 ))
 HERE=$(cd "$(dirname "$0")" && pwd)
 SLUG="sslvlm-$(echo "$ARM" | tr 'A-Z_.' 'a-z--')"
 BUILD="$HERE/build/$SLUG"; OUTDIR="$HERE/output/$SLUG"
-ACCELERATOR=${ACCELERATOR:-NvidiaTeslaT4}; POLL=${POLL:-120}
+ACCELERATOR=${ACCELERATOR:-NvidiaTeslaT4}; POLL=${POLL:-120}; NOTEBOOK=${NOTEBOOK:-sslvlm_kaggle.ipynb}
 command -v kaggle >/dev/null || { echo "kaggle CLI missing: pip install kaggle"; exit 1; }
 mkdir -p "$BUILD" "$OUTDIR"
 
-python3 - "$HERE/sslvlm_kaggle.ipynb" "$BUILD/sslvlm_kaggle.ipynb" "$ARM" "$@" <<'PY'
+python3 - "$HERE/$NOTEBOOK" "$BUILD/$NOTEBOOK" "$ARM" "$@" <<'PY'
 import json, sys
 src, dst, arm, *kv = sys.argv[1:]
 over = {"ARM": arm}
@@ -48,7 +49,7 @@ if hits != 1:
 json.dump(nb, open(dst, "w"), indent=1)
 print("overrides:", over)
 PY
-sed -e "s/KAGGLE_USERNAME/$KUSER/" -e "s/KERNEL_SLUG/$SLUG/g" "$HERE/kernel-metadata.json" > "$BUILD/kernel-metadata.json"
+sed -e "s/KAGGLE_USERNAME/$KUSER/" -e "s/KERNEL_SLUG/$SLUG/g" -e "s/sslvlm_kaggle.ipynb/$NOTEBOOK/" "$HERE/kernel-metadata.json" > "$BUILD/kernel-metadata.json"
 if [[ -n ${DATASETS:-} ]]; then  # extra Kaggle datasets to attach, comma-separated user/slug (e.g. a checkpoint)
   python3 - "$BUILD/kernel-metadata.json" "$DATASETS" <<'PY'
 import json, sys

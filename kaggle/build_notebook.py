@@ -796,13 +796,136 @@ for p in sorted(OUT.iterdir()):
     print(p)
 """)
 
-def build(path: Path) -> None:
+# ------------------------------------------------------------------------------------------------------------
+# Script notebook (kaggle/script_kaggle.ipynb): no training, runs one `python -m serverless.<module> ...` command
+# on the Kaggle GPUs (phase-0 checks). run.sh picks it with NOTEBOOK=script_kaggle.ipynb.
+SCRIPT_CELLS: list[tuple[str, str]] = []
+_main_cells = CELLS
+CELLS = SCRIPT_CELLS
+
+md("""
+# SSLVLM on Kaggle: one script, no training
+
+Runs a phase-0 style command from [erow/ServerlessRL](https://github.com/erow/ServerlessRL) on the Kaggle GPUs
+(T4 x2: the VLM on cuda:0, judge/embedding models on cuda:1). Outputs go to `/kaggle/working/out/<ARM>/`.
+""")
+
+code("""
+# Cell 1: install. Unsloth gives the fp16-safe 4-bit Qwen3-VL path used by the trainer on T4s.
+%pip install -q unsloth
+%pip install -q "transformers>=4.57" pycocotools
+""")
+
+code("""
+# Cell 2: configuration. run.sh replaces the CONFIG_OVERRIDES line below; keep it on one line.
+CONFIG = dict(
+    ARM="l2g-phase0",
+    REPO_URL="https://github.com/erow/ServerlessRL.git",
+    REPO_REF="local-to-global",
+    EXTRA_ARGS=[],                   # appended to the script's arguments, e.g. ["--n", "4"]
+)
+CONFIG_OVERRIDES = {}
+
+# {VAL_DIR}, {TRAIN_DIR}, {OUT} and {INDEX:<split>} (COCO label index, built on first use) are filled in.
+SCRIPTS = {
+    # Local-to-global caption game, phase 0 (design doc https://claude.ai/artifact/UBfwevBPjHPdm549hBkWiU).
+    "l2g-phase0": dict(module="serverless.l2g", args=[
+        "phase0", "--images", "{VAL_DIR}", "--index", "{INDEX:val2017}", "--out-dir", "{OUT}",
+        "--loader", "unsloth", "--n", "200", "--scales", "0.1,0.2,0.3", "--group", "8"]),
+    "l2g-phase0-smoke": dict(module="serverless.l2g", args=[
+        "phase0", "--images", "{VAL_DIR}", "--index", "{INDEX:val2017}", "--out-dir", "{OUT}",
+        "--loader", "unsloth", "--n", "4", "--scales", "0.1,0.3", "--group", "4", "--pool", "50",
+        "--label-n", "5"]),
+}
+CONFIG.update(CONFIG_OVERRIDES)
+SCRIPT = SCRIPTS[CONFIG["ARM"]]
+CONFIG
+""")
+
+code("""
+# Cell 3: data and code (val2017 + annotations only), then the command.
+import json, os, re, subprocess, sys, time
+from pathlib import Path
+
+def find(name, kind="dir", root=Path("/kaggle/input"), max_depth=6):
+    for depth in range(max_depth + 1):
+        for p in sorted(root.glob("/".join(["*"] * depth + [name]))):
+            if (p.is_dir() if kind == "dir" else p.is_file()):
+                return p
+    raise FileNotFoundError(f"{name} not found under {root}; attach a COCO 2017 dataset")
+
+t0 = time.time()
+while True:  # attached datasets can still be mounting when the notebook starts
+    try:
+        VAL_DIR, TRAIN_DIR = find("val2017"), find("train2017")
+        find("instances_val2017.json", "file")
+        if sum(1 for _ in os.scandir(VAL_DIR)) >= 5000:
+            break
+    except FileNotFoundError:
+        pass
+    if time.time() - t0 > 1800:
+        raise RuntimeError("COCO val2017 mount incomplete after 30 min")
+    print("waiting for the COCO mount"); time.sleep(30)
+print("COCO:", VAL_DIR)
+
+SRC = Path("/tmp/src")
+if not (SRC / "serverless").exists():
+    subprocess.run(["git", "clone", "-q", CONFIG["REPO_URL"], str(SRC / "serverless")], check=True)
+    subprocess.run(["git", "-C", str(SRC / "serverless"), "checkout", "-q", CONFIG["REPO_REF"]], check=True)
+REPO_COMMIT = subprocess.run(["git", "-C", str(SRC / "serverless"), "rev-parse", "HEAD"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+(SRC / "sslvlm").mkdir(exist_ok=True)
+(SRC / "sslvlm" / "__init__.py").write_text("")
+(SRC / "sslvlm" / "config.py").write_text(
+    f"from pathlib import Path\\nCOCO_DIR = Path({str(TRAIN_DIR)!r})\\nOUTPUT_ROOT = Path('/kaggle/working/out')\\n")
+env = dict(os.environ, PYTHONPATH=str(SRC) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+print("code:", CONFIG["REPO_REF"], REPO_COMMIT)
+
+OUT = Path("/kaggle/working/out") / CONFIG["ARM"]
+OUT.mkdir(parents=True, exist_ok=True)
+INDEX_DIR = Path("/kaggle/working/index")
+
+def label_index(split):
+    out = INDEX_DIR / f"{split}_labels.npz"
+    if not out.exists():
+        INDEX_DIR.mkdir(parents=True, exist_ok=True)
+        cmd = [sys.executable, "-m", "serverless.hardneg", "build-index",
+               "--instances", str(find(f"instances_{split}.json", "file")), "--out", str(out)]
+        try:
+            cmd += ["--stuff", str(find(f"stuff_{split}.json", "file"))]
+        except FileNotFoundError:
+            print("no COCO-Stuff annotations; things only")
+        subprocess.run(cmd, check=True, env=env)
+    return str(out)
+
+def fill(a):
+    a = a.replace("{VAL_DIR}", str(VAL_DIR)).replace("{TRAIN_DIR}", str(TRAIN_DIR)).replace("{OUT}", str(OUT))
+    return re.sub(r"\\{INDEX:(\\w+)\\}", lambda m: label_index(m.group(1)), a)
+
+cmd = [sys.executable, "-u", "-m", SCRIPT["module"]] + [fill(a) for a in SCRIPT["args"]] + list(CONFIG["EXTRA_ARGS"])
+(OUT / "command.json").write_text(json.dumps({"cmd": cmd, "repo_commit": REPO_COMMIT, "config": CONFIG}, indent=1))
+print(" ".join(cmd), flush=True)
+proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+with open(OUT / "log.txt", "w") as log:
+    for line in proc.stdout:
+        print(line, end="", flush=True); log.write(line); log.flush()
+rc = proc.wait()
+print("exit code", rc, f"after {(time.time() - t0) / 3600:.2f} h")
+for p in sorted(OUT.iterdir()):
+    print(p)
+assert rc == 0, f"script failed with exit code {rc}; see out/{CONFIG['ARM']}/log.txt"
+""")
+
+CELLS = _main_cells
+
+
+def build(path: Path, cells_src=None) -> None:
     def lines(src: str) -> list[str]:
         parts = src.split("\n")
         return [l + "\n" for l in parts[:-1]] + [parts[-1]]
 
     cells = []
-    for kind, src in CELLS:
+    for kind, src in (CELLS if cells_src is None else cells_src):
         cell = {"cell_type": kind, "metadata": {}, "source": lines(src)}
         if kind == "code":
             cell.update(execution_count=None, outputs=[])
@@ -822,3 +945,4 @@ def build(path: Path) -> None:
 
 if __name__ == "__main__":
     build(Path(__file__).with_name("sslvlm_kaggle.ipynb"))
+    build(Path(__file__).with_name("script_kaggle.ipynb"), SCRIPT_CELLS)
