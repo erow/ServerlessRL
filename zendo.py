@@ -229,6 +229,7 @@ class Bank:
     def similar(self, i: int, cands: np.ndarray, ignore: frozenset[str]) -> np.ndarray:
         """Candidates sorted by cosine similarity of category vectors to image i, rule categories masked out."""
         mask = self.mask(ignore)
+        cands = np.asarray(cands, dtype=np.int64)
         a = self.vec[i] * mask
         b = self.vec[cands] * mask
         sim = b @ a / (np.linalg.norm(b, axis=1) * np.linalg.norm(a) + 1e-6)
