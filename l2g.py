@@ -420,6 +420,19 @@ def emb_similarity(embed: Embedder, refs: list[str], guesses: list[str]) -> list
     return out
 
 
+def _features(out):
+    """get_*_features returns a tensor in transformers 4.x and an output object (pooler_output) in 5.x."""
+    import torch
+
+    if torch.is_tensor(out):
+        return out
+    for key in ("pooler_output", "image_embeds", "text_embeds"):
+        v = getattr(out, key, None)
+        if torch.is_tensor(v):
+            return v
+    raise TypeError(f"no feature tensor in {type(out).__name__}")
+
+
 class Retriever:
     """SigLIP text -> image retrieval among the true image and its look-alikes."""
 
@@ -438,7 +451,7 @@ class Retriever:
             chunk = named[i : i + batch]
             inp = self.proc(images=[im for _, im in chunk], return_tensors="pt").to(self.device)
             with torch.no_grad():
-                v = self.model.get_image_features(**inp).float()
+                v = _features(self.model.get_image_features(**inp)).float()
             v = torch.nn.functional.normalize(v, dim=-1).cpu().numpy()
             self.image_vecs.update({n: x for (n, _), x in zip(chunk, v)})
 
@@ -450,7 +463,7 @@ class Retriever:
             inp = self.proc(text=[t or "." for t in texts[i : i + batch]], padding="max_length", max_length=64,
                             truncation=True, return_tensors="pt").to(self.device)
             with torch.no_grad():
-                v = self.model.get_text_features(**inp).float()
+                v = _features(self.model.get_text_features(**inp)).float()
             out.append(torch.nn.functional.normalize(v, dim=-1).cpu().numpy())
         return np.concatenate(out)
 
