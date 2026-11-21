@@ -10,8 +10,11 @@ One puzzle: a hidden rule r(x) (a predicate computed from COCO instance annotati
 
 Rules (families): category ("contains a dog"), count ("at least 3 people"), supercategory ("contains an animal"),
 size ("the largest object covers more than a third of the image"), clutter ("at least 10 annotated objects"),
-spatial ("the largest object is in the left half"), and AND-NOT combinations of category/supercategory rules.
-The `spatial` family is held out as the test family.
+position ("a person is in the left third of the image"), and AND-NOT combinations of category/supercategory
+rules. The `position` family is held out as the test family. Count and position rules have a domain (the image
+contains the category): their negatives come from that domain, so "contains a dog" cannot solve "at least 2 dogs"
+or "a dog in the left third". Phase 0 showed that size/clutter rules and the old "largest object in a third"
+rules are not visible (true-rule listener 0.54-0.67), so they are no longer built.
 
 Negatives ("negatives" option):
   random  - any image that breaks the rule.
@@ -108,10 +111,15 @@ class Rule:
     text: str  # what a perfect player could say; also fed to the listener as its ceiling
     fn: Callable[[Rec], bool] = field(repr=False)
     cats: frozenset[str] = frozenset()  # categories the rule mentions (ignored by near-miss similarity)
+    domain: Callable[[Rec], bool] | None = field(default=None, repr=False)  # negatives are drawn from here
 
 
 def largest(r: Rec):
     return max(r.objs, key=lambda o: o[2])
+
+
+def prominent(r: Rec, c: str, min_area: float) -> list:
+    return [o for o in r.objs if o[0] == c and o[2] >= min_area * r.w * r.h]
 
 
 def build_rules(recs: list[Rec], sup: dict[str, str], min_prev: float, max_prev: float, combos: int,
@@ -124,35 +132,34 @@ def build_rules(recs: list[Rec], sup: dict[str, str], min_prev: float, max_prev:
                           lambda r, c=c: r.counts[c] > 0, frozenset([c])))
         for k in (2, 3, 5):
             rules.append(Rule(f"count:{c}>={k}", "count", f"The image contains at least {k} {plural(c)}.",
-                              lambda r, c=c, k=k: r.counts[c] >= k, frozenset([c])))
+                              lambda r, c=c, k=k: r.counts[c] >= k, frozenset([c]), lambda r, c=c: r.counts[c] > 0))
+        # Position of a clearly visible instance (>= 2% of the image); domain: some visible instance exists.
+        for side, test in (("left", lambda o, r: o[1][0] + o[1][2] / 2 < r.w / 3),
+                           ("right", lambda o, r: o[1][0] + o[1][2] / 2 > 2 * r.w / 3)):
+            rules.append(Rule(f"pos:{c}:{side}", "position", f"There is {article(c)} in the {side} third of the image.",
+                              lambda r, c=c, test=test: any(test(o, r) for o in prominent(r, c, 0.02)),
+                              frozenset([c]), lambda r, c=c: bool(prominent(r, c, 0.02))))
     for s in supers:
         if s == "person":
             continue
         cs = frozenset(c for c in names if sup[c] == s)
         rules.append(Rule(f"super:{s}", "supercategory", f"The image contains {SUPER_TEXT.get(s, s)}.",
                           lambda r, s=s: s in r.supers, cs))
-    rules += [
-        Rule("size:big", "size", "The largest object covers more than a third of the image.",
-             lambda r: largest(r)[2] > r.w * r.h / 3),
-        Rule("size:small", "size", "Every object is small: none covers more than 5% of the image.",
-             lambda r: largest(r)[2] < 0.05 * r.w * r.h),
-        Rule("clutter:10", "clutter", "The image shows at least 10 separate objects.", lambda r: len(r.objs) >= 10),
-        Rule("clutter:single", "clutter", "The image shows exactly one object.", lambda r: len(r.objs) == 1),
-        Rule("spatial:left", "spatial", "The largest object is in the left third of the image.",
-             lambda r: (largest(r)[1][0] + largest(r)[1][2] / 2) < r.w / 3),
-        Rule("spatial:right", "spatial", "The largest object is in the right third of the image.",
-             lambda r: (largest(r)[1][0] + largest(r)[1][2] / 2) > 2 * r.w / 3),
-        Rule("spatial:top", "spatial", "The largest object is in the top third of the image.",
-             lambda r: (largest(r)[1][1] + largest(r)[1][3] / 2) < r.h / 3),
-        Rule("spatial:bottom", "spatial", "The largest object is in the bottom third of the image.",
-             lambda r: (largest(r)[1][1] + largest(r)[1][3] / 2) > 2 * r.h / 3),
-    ]
     n = len(recs)
 
     def prev(rule: Rule) -> float:
         return sum(rule.fn(r) for r in recs) / n
 
-    keep = [r for r in rules if min_prev <= prev(r) <= max_prev]
+    def ok(rule: Rule) -> bool:
+        if rule.domain is None:
+            return min_prev <= prev(rule) <= max_prev
+        dom = [r for r in recs if rule.domain(r)]
+        if len(dom) < min_prev * n:  # the domain itself must be common enough
+            return False
+        cond = sum(rule.fn(r) for r in dom) / len(dom)
+        return 0.15 <= cond <= 0.85  # and the rule must split it
+
+    keep = [r for r in rules if ok(r)]
     # AND-NOT combinations of frequent category / supercategory rules, e.g. "a person but no car".
     atoms = [r for r in rules if r.family in ("category", "supercategory") and prev(r) >= 2 * min_prev]
     rng = random.Random(f"{seed}:combos")
@@ -184,7 +191,8 @@ class ZendoConfig:
     near_pool: int = 10  # near misses are drawn from this many most similar rule-breaking images
     disc_candidates: int = 12  # near-disc: candidate queries per side
     image_side: int = 336  # longer side of every image shown to the model
-    families: str = "category,count,supercategory,size,clutter,and-not"  # train families; spatial is held out
+    families: str = "category:1,count:1,supercategory:1,and-not:0.3"  # train families:weight; position held out
+    test_families: str = "position:1"
     min_prev: float = 0.03
     max_prev: float = 0.5
     combos: int = 40
@@ -218,6 +226,19 @@ class Bank:
         self.cat_index = ci
         self.truth = np.array([[rule.fn(r) for r in recs] for rule in rules], dtype=bool)  # rules x images
         self.by_key = {r.key: i for i, r in enumerate(rules)}
+        self.domain = np.array([[True] * len(recs) if rule.domain is None else [rule.domain(r) for r in recs]
+                                for rule in rules], dtype=bool)
+        self._usable: dict = {}
+
+    def usable(self, family: str, need: int) -> list[int]:
+        """Rules of a family with at least `need` positives and `need` in-domain negatives here."""
+        key = (family, need)
+        if key not in self._usable:
+            pos = self.truth.sum(1)
+            neg = (~self.truth & self.domain).sum(1)
+            self._usable[key] = [i for i, r in enumerate(self.rules)
+                                 if r.family == family and pos[i] >= need and neg[i] >= need]
+        return self._usable[key]
 
     def mask(self, ignore: frozenset[str]) -> np.ndarray:
         mask = np.ones(len(self.cats), np.float32)
@@ -236,12 +257,24 @@ class Bank:
         return cands[np.argsort(-sim, kind="stable")]
 
 
-def make_puzzle(cfg: ZendoConfig, bank: Bank, rng: random.Random, families: list[str]) -> Puzzle:
-    fam_rules = [i for i, r in enumerate(bank.rules) if r.family in families]
-    ri = rng.choice(fam_rules)
+def parse_families(spec: str) -> dict[str, float]:
+    out = {}
+    for part in spec.split(","):
+        if part:
+            name, _, w = part.partition(":")
+            out[name] = float(w or 1)
+    return out
+
+
+def make_puzzle(cfg: ZendoConfig, bank: Bank, rng: random.Random, families: dict[str, float]) -> Puzzle:
+    """Family by weight, then a rule of that family with enough positives and negatives in this bank."""
+    need = cfg.shots + cfg.queries + cfg.disc_candidates
+    fams = {f: w for f, w in families.items() if bank.usable(f, need)}
+    fam = rng.choices(list(fams), weights=list(fams.values()))[0]
+    ri = rng.choice(bank.usable(fam, need))
     rule = bank.rules[ri]
     t = bank.truth[ri]
-    pos_all, neg_all = np.flatnonzero(t), np.flatnonzero(~t)
+    pos_all, neg_all = np.flatnonzero(t), np.flatnonzero(~t & bank.domain[ri])
     q = cfg.queries // 2
     pos = [int(x) for x in rng.sample(list(pos_all), cfg.shots + (q if cfg.negatives != "near-disc" else 0))]
     used = set(pos)
@@ -290,11 +323,13 @@ def make_puzzle(cfg: ZendoConfig, bank: Bank, rng: random.Random, families: list
                         "prevalence": float(bank.truth[ri].mean())})
 
 
-def make_puzzles(cfg: ZendoConfig, bank: Bank, seed: int, split: str, n: int) -> list[Puzzle]:
-    fams = [f for f in cfg.families.split(",") if f] if split == "train" else ["spatial"]
+def make_puzzles(cfg: ZendoConfig, bank: Bank, seed: int, split: str, n: int, step: int = 0,
+                 families: str | None = None) -> list[Puzzle]:
+    """Deterministic: (seed, split, step, slot) always gives the same puzzle. split 'test' = held-out families."""
+    fams = parse_families(families or (cfg.test_families if split == "test" else cfg.families))
     out = []
     for slot in range(n):
-        rng = random.Random(f"{seed}:zendo:{split}:{slot}")
+        rng = random.Random(f"{seed}:zendo:{split}:{step}:{slot}")
         out.append(make_puzzle(cfg, bank, rng, fams))
     return out
 
@@ -319,11 +354,14 @@ LISTENER_PROMPT = "Rule: \"{rule}\"\nDoes this image follow the rule? Answer yes
 class Images:
     def __init__(self, root: Path, recs: list[Rec], side: int):
         self.root, self.recs, self.side, self.cache = Path(root), recs, side, {}
+        self.max_cache = 4000
 
     def __getitem__(self, i: int) -> Image.Image:
         if i not in self.cache:
             img = Image.open(self.root / self.recs[i].name).convert("RGB")
             img.thumbnail((self.side, self.side), Image.Resampling.BICUBIC)
+            if len(self.cache) >= self.max_cache:  # training touches ~10^4 images: keep memory bounded
+                self.cache.pop(next(iter(self.cache)))
             self.cache[i] = img
         return self.cache[i]
 
@@ -643,7 +681,7 @@ def main(argv: list[str] | None = None) -> None:
     q.add_argument("--model", default="unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-4bit")
     q.add_argument("--device", default="cuda")
     q.add_argument("--n", type=int, default=300)
-    q.add_argument("--split", default="train", help="train = train families, test = held-out spatial family")
+    q.add_argument("--split", default="train", help="train = train families, test = held-out position family")
     q.add_argument("--group", type=int, default=8)
     q.add_argument("--max-new-tokens", type=int, default=64)
     q.add_argument("--batch", type=int, default=4)

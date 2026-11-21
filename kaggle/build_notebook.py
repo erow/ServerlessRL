@@ -73,6 +73,11 @@ CONFIG = dict(
     # picks it among RG_SCHEME's look-alike crops; PROMPTS_PER_STEP rounds x GROUP_SIZE descriptions per step.
     # RG_SCHEME keys are RefGameConfig fields (serverless/refgame.py); "oracle_index": "auto" builds the index.
     RG_SCHEME={}, RG_VAL_ROUNDS=64, RG_LISTENER_BATCH=8,
+    # Zendo (ARM zendo*): Z1 rule induction. 6 + 6 example images and 4 queries per puzzle; reward = share of
+    # queries answered right. ZD_SCHEME keys are ZendoConfig fields (serverless/zendo.py). Rules are built from
+    # train2017 instances; val = val2017 puzzles of the train families, test = val2017 puzzles of the held-out
+    # position family ("there is a dog in the left third of the image").
+    ZD_SCHEME={}, ZD_VAL_N=96, ZD_TEST_N=64,
 )
 CONFIG_OVERRIDES = {}
 
@@ -120,6 +125,14 @@ ARMS = {
                    "max_words": 15,
                    "distractors": "same-image,oracle-cat,oracle-cat,oracle-cat,oracle-dist,oracle-dist,oracle-dist"}),
     ),
+    # Zendo Z1 after phase 0: near-miss negatives + discriminative queries (zendo-cls) vs random negatives
+    # (zendo-cls-rand, where a frozen SigLIP centroid already beat the VLM). ~30 output tokens.
+    "zendo-cls": dict(game="zendo", config=dict(
+        REPO_REF="zendo", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=80, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=25, SAVE_EVERY=20, ZD_SCHEME={"negatives": "near-disc", "image_side": 280})),
+    "zendo-cls-rand": dict(game="zendo", config=dict(
+        REPO_REF="zendo", LR=2e-5, STEPS=200, MAX_NEW_TOKENS=80, PROMPTS_PER_STEP=8, GROUP_SIZE=8,
+        VAL_EVERY=25, SAVE_EVERY=20, ZD_SCHEME={"negatives": "random", "image_side": 280})),
 }
 ARM = ARMS[CONFIG_OVERRIDES.get("ARM", CONFIG["ARM"])]
 for k, v in ARM.get("config", {}).items():
@@ -234,6 +247,22 @@ elif GAME == "refgame":
     RG_TRAIN, RG_VAL = rg_config("train2017"), rg_config("val2017")
     r = RG.step_rounds(RG_TRAIN, train_src, CONFIG["SEED"], "train", 0, 1)[0]
     print("referring game:", r.image, r.box, r.meta["kinds"], "answer", RG.LETTERS[r.answer])
+elif GAME == "zendo":
+    import dataclasses
+    import serverless.zendo as ZD
+    ZD_CFG = dataclasses.replace(ZD.ZendoConfig(), **CONFIG["ZD_SCHEME"])
+    t = time.time()
+    zd_train_recs, zd_sup = ZD.load_records(find("instances_train2017.json", "file"))
+    zd_val_recs, _ = ZD.load_records(find("instances_val2017.json", "file"))
+    ZD_RULES = ZD.build_rules(zd_train_recs, zd_sup, ZD_CFG.min_prev, ZD_CFG.max_prev, ZD_CFG.combos, CONFIG["SEED"])
+    ZD_TRAIN, ZD_VAL = ZD.Bank(zd_train_recs, ZD_RULES), ZD.Bank(zd_val_recs, ZD_RULES)
+    ZD_TRAIN_IMS = ZD.Images(TRAIN_DIR, zd_train_recs, ZD_CFG.image_side)
+    ZD_VAL_IMS = ZD.Images(VAL_DIR, zd_val_recs, ZD_CFG.image_side)
+    import collections
+    print(f"zendo: {len(ZD_RULES)} rules {dict(collections.Counter(r.family for r in ZD_RULES))}, "
+          f"{len(zd_train_recs)} train / {len(zd_val_recs)} val images, {time.time() - t:.0f}s")
+    pz = ZD.make_puzzles(ZD_CFG, ZD_TRAIN, CONFIG["SEED"], "train", 1)[0]
+    print("zendo puzzle:", pz.rule, pz.text, pz.labels, pz.meta)
 else:
     # caption_game imports message_reasoning from serverless.train, which pulls in the W&B/ART client; a stub
     # is enough because thinking is off here.
@@ -665,7 +694,8 @@ import dataclasses
 (OUT / "run_config.json").write_text(json.dumps(
     {**CONFIG, "repo_commit": REPO_COMMIT,
      "objective": train_obj.describe() if GAME == "puzzles" else
-                  dataclasses.asdict(RG_TRAIN) if GAME == "refgame" else dataclasses.asdict(CG_CFG)},
+                  dataclasses.asdict(RG_TRAIN) if GAME == "refgame" else
+                  dataclasses.asdict(ZD_CFG) if GAME == "zendo" else dataclasses.asdict(CG_CFG)},
     indent=1, default=str))
 
 def puzzle_step(step):
@@ -761,8 +791,51 @@ def refgame_evaluate(step):
     append(f"val_rounds_step{step:05d}.jsonl", rows)
     return out
 
-train_step = {"puzzles": puzzle_step, "caption": caption_step, "refgame": refgame_step}[GAME]
-val_fn = {"puzzles": evaluate, "caption": caption_evaluate, "refgame": refgame_evaluate}[GAME]
+def zendo_step(step):
+    puzzles = ZD.make_puzzles(ZD_CFG, ZD_TRAIN, CONFIG["SEED"], "train", CONFIG["PROMPTS_PER_STEP"], step=step)
+    G = CONFIG["GROUP_SIZE"]
+    rollouts, scores, samples, lens = [], [], [], []
+    for pz in puzzles:
+        inputs = encode_content(*ZD.z1_item(pz, ZD_TRAIN_IMS))
+        seqs, texts = generate(inputs, G)
+        sc = [ZD.score_z1(pz, t) for t in texts]
+        adv = group_advantages([s["reward"] for s in sc])
+        if adv:
+            rollouts += [(inputs, s, a) for s, a in zip(seqs, adv)]
+        scores += sc; lens += [len(s) for s in seqs]
+        samples.append({"step": step, "rule": pz.rule, "family": pz.family, "labels": pz.labels,
+                        "responses": texts, "rewards": [s["reward"] for s in sc]})
+    append("samples.jsonl", samples)
+    stats = {f"train/{k}": ZD.mean_of(scores, k) for k in ("reward", "accuracy", "parsed", "yes_rate")}
+    stats["train/completion_tokens"] = statistics.mean(lens)
+    stats["train/groups_with_signal"] = len(rollouts) / G / len(puzzles)
+    return rollouts, stats
+
+def zendo_evaluate(step):
+    \"\"\"Greedy Z1 on fixed val2017 puzzles: train families (val/) and the held-out position family (test/).
+    At step 0 also the query-only floor (no examples shown).\"\"\"
+    out = {}
+    for split, n in (("train", CONFIG["ZD_VAL_N"]), ("test", CONFIG["ZD_TEST_N"])):
+        tag = "val" if split == "train" else "test"
+        puzzles = ZD.make_puzzles(ZD_CFG, ZD_VAL, CONFIG["SEED"], split, n)
+        texts = [generate(encode_content(*ZD.z1_item(pz, ZD_VAL_IMS)), 1, greedy=True)[1][0] for pz in puzzles]
+        sc = [ZD.score_z1(pz, t) for pz, t in zip(puzzles, texts)]
+        out.update({f"{tag}/{k}": ZD.mean_of(sc, k) for k in ("accuracy", "parsed", "yes_rate")})
+        for fam, acc in ZD.by_family(puzzles, [s["accuracy"] for s in sc]).items():
+            out[f"{tag}/{fam}/accuracy"] = acc
+        if step == 0:
+            qo = [generate(encode_content(*ZD.z1_query_only_item(pz, ZD_VAL_IMS)), 1, greedy=True)[1][0]
+                  for pz in puzzles]
+            out[f"{tag}/query_only_accuracy"] = ZD.mean_of([ZD.score_z1(pz, t) for pz, t in zip(puzzles, qo)],
+                                                           "accuracy")
+        append(f"val_{tag}_step{step:05d}.jsonl", [
+            {"rule": pz.rule, "family": pz.family, "labels": pz.labels, "response": t, "score": s}
+            for pz, t, s in zip(puzzles, texts, sc)])
+    return out
+
+train_step = {"puzzles": puzzle_step, "caption": caption_step, "refgame": refgame_step, "zendo": zendo_step}[GAME]
+val_fn = {"puzzles": evaluate, "caption": caption_evaluate, "refgame": refgame_evaluate,
+          "zendo": zendo_evaluate}[GAME]
 
 t0 = time.time()
 if start == 0 and CONFIG["VAL_EVERY"] and CONFIG["VAL_AT_START"]:
