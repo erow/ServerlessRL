@@ -794,6 +794,110 @@ def label_sheet(out: Path, scored: list[dict], refs: dict, images: dict, n: int,
                         f"{r['emb']:.3f}", "", "", ""])
 
 
+def rescore_outcrop(args: argparse.Namespace) -> None:
+    """Phase 0b: which reference facts are visible in each crop? Re-score from phase-0 caches with recall over the
+    facts the crop does NOT show (owrecall), so copying the visible content into Scene earns nothing.
+
+    Needs references/samples/hits/scores/facts_weighted from `phase0` in --out-dir; adds crop_facts.jsonl and
+    summary_outcrop.json. One VLM yes/no per (crop, fact)."""
+    out = Path(args.out_dir)
+    cfg = L2GConfig()
+    load = lambda name: [json.loads(l) for l in (out / name).read_text().splitlines() if l.strip()]  # noqa: E731
+    samples, scores_rows = load("samples.jsonl"), load("scores.jsonl")
+    facts = {r["image"]: r["facts"] for r in load("facts_weighted.jsonl")}
+    hits = {(r["image"], r["label"]): r["hits"] for r in load("hits.jsonl")}
+    scored = scores_rows[: len(samples)]
+    source = ImageSource(Path(args.images))
+
+    crops = sorted({(r["image"], r["image"], tuple(r["box"])) for r in samples
+                    if "box" in r and r["kind"] != "other_crop"})
+
+    def build():
+        model, processor = load_vlm(args.model, args.vlm_device, args.loader)
+        items, keys = [], []
+        cache: dict[str, Image.Image] = {}
+        for src, img_name, box in crops:
+            if src not in cache:
+                cache.clear()
+                cache[src] = source.load(source.index_of(src))
+            crop = resize_long(cache[src].crop(box), cfg.crop_side)
+            for j, f in enumerate(facts[img_name]):
+                items.append((VERIFY_PROMPT.format(fact=f["fact"]), crop)); keys.append((src, img_name, box, j))
+        probs = vlm_yes_probs(model, processor, items, args.vlm_device, args.score_batch)
+        per: dict[tuple, list[float]] = {}
+        for (src, img_name, box, j), p in zip(keys, probs):
+            per.setdefault((src, img_name, box), [0.0] * len(facts[img_name]))[j] = p
+        return [{"crop_of": k[0], "image": k[1], "box": list(k[2]), "in_crop_p": v} for k, v in per.items()]
+
+    crop_facts = {(r["crop_of"], r["image"], tuple(r["box"])): r["in_crop_p"]
+                  for r in jsonl_cache(out / "crop_facts.jsonl", build)}
+
+    def outcrop(img_name: str, h: list[float], in_p: list[float]) -> dict[str, float]:
+        w = [f["weight"] for f in facts[img_name]]
+        out_mask = [p < cfg.verify_threshold for p in in_p]
+        wo = [wi for wi, m in zip(w, out_mask) if m]
+        ho = [hi for hi, m in zip(h, out_mask) if m]
+        wi_ = [wi for wi, m in zip(w, out_mask) if not m]
+        hi_ = [hi for hi, m in zip(h, out_mask) if not m]
+        return {"owrecall": float(np.dot(ho, wo) / sum(wo)) if wo and sum(wo) > 0 else 0.0,
+                "orecall": mean(ho) if ho else 0.0,
+                "inrecall": float(np.dot(hi_, wi_) / sum(wi_)) if wi_ and sum(wi_) > 0 else 0.0,
+                "n_out": float(len(wo)), "n_in": float(len(wi_))}
+
+    rows = []
+    greedy_vis = {}
+    for i, (r, sc) in enumerate(zip(samples, scored)):
+        if "box" not in r:
+            continue
+        key = (r.get("crop_of", r["image"]), r["image"], tuple(r["box"]))
+        # other_crop rows: what the guess hits among the facts that the *true* image's 0.2 crop does not show
+        if r["kind"] == "other_crop":
+            ref_key = next(((r["image"], r["image"], tuple(x["box"])) for x in samples
+                            if x["image"] == r["image"] and x["kind"] == "greedy" and x["scale"] == cfg.blind_scale),
+                           None)
+            in_p = crop_facts.get(ref_key) if ref_key else None
+            if in_p is None:
+                continue
+        else:
+            in_p = crop_facts[key]
+        o = outcrop(r["image"], hits[(r["image"], f"row{i}")], in_p)
+        row = {"kind": r["kind"], "image": r["image"], "scale": r.get("scale"), **o,
+               "precision": sc["precision"], "contra": sc["contra"], "vis_prec": sc["vis_prec"]}
+        rows.append(row)
+        if r["kind"] == "greedy":
+            v = outcrop(r["image"], hits[(r["image"], f"visonly{i}")], in_p)
+            vrow = {"kind": "visible_only", "image": r["image"], "scale": r["scale"], **v, "vis_prec": sc["vis_prec"]}
+            rows.append(vrow)
+            greedy_vis[(r["image"], r["scale"])] = (row, vrow)
+
+    def reward(x):  # phase-0 reward with owrecall in place of wrecall (visible_only keeps its own vis_prec)
+        return (x["owrecall"] + cfg.w_precision * x.get("precision", 0.0) - cfg.w_contra * x.get("contra", 0.0)
+                + cfg.w_visible * x.get("vis_prec", 0.0))
+
+    for x in rows:
+        x["reward_o"] = reward(x)
+    keys_m = ("owrecall", "orecall", "inrecall", "n_out", "n_in", "reward_o")
+    summ: dict[str, Any] = {}
+    summ["other_crop"] = {m: mean(x[m] for x in rows if x["kind"] == "other_crop") for m in keys_m}
+    for s in sorted({x["scale"] for x in rows if x["kind"] == "sampled"}):
+        part = {k: [x for x in rows if x["kind"] == k and x["scale"] == s] for k in ("greedy", "sampled", "visible_only")}
+        groups: dict[str, list[float]] = {}
+        for x in part["sampled"]:
+            groups.setdefault(x["image"], []).append(x["reward_o"])
+        stds = [statistics.pstdev(v) for v in groups.values() if len(v) > 1]
+        paired = [g["owrecall"] - v["owrecall"] for (img, sc_), (g, v) in greedy_vis.items() if sc_ == s]
+        summ[f"scale_{s:g}"] = {k: {m: mean(x[m] for x in v) for m in keys_m} for k, v in part.items()} | {
+            "groups_with_signal": mean(float(x > 0.05) for x in stds), "group_std": mean(stds),
+            "paired_greedy_minus_visible_owrecall": mean(paired),
+            "share_greedy_above_visible": mean(float(d > 0) for d in paired),
+        }
+    (out / "summary_outcrop.json").write_text(json.dumps(summ, indent=1))
+    with open(out / "scores_outcrop.jsonl", "w") as f:
+        for x in rows:
+            f.write(json.dumps(x) + "\n")
+    print(json.dumps(summ, indent=1), flush=True)
+
+
 def _free() -> None:
     import gc
 
@@ -836,9 +940,18 @@ def main(argv: list[str] | None = None) -> None:
     q.add_argument("--pool", type=int, default=2000, help="val images searched for retrieval look-alikes")
     q.add_argument("--label-n", type=int, default=50)
     q.add_argument("--seed", type=int, default=0)
+    r = sub.add_parser("outcrop", help="phase 0b: re-score phase-0 caches on facts the crop does not show")
+    r.add_argument("--images", required=True)
+    r.add_argument("--out-dir", required=True, help="a finished phase0 out dir")
+    r.add_argument("--model", default="unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-4bit")
+    r.add_argument("--loader", default="hf", choices=["hf", "unsloth"])
+    r.add_argument("--vlm-device", default="cuda:0")
+    r.add_argument("--score-batch", type=int, default=16)
     args = p.parse_args(argv)
     if args.cmd == "phase0":
         phase0(args)
+    elif args.cmd == "outcrop":
+        rescore_outcrop(args)
 
 
 if __name__ == "__main__":
