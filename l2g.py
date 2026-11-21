@@ -898,6 +898,330 @@ def rescore_outcrop(args: argparse.Namespace) -> None:
     print(json.dumps(summ, indent=1), flush=True)
 
 
+# ---------------------------------------------------------------------------------------------- phase 0d
+
+MULTI_PROMPT = (
+    "These are {k} small crops cut out of the same larger photo, at different places. First describe what is "
+    "visible in the crops. Then guess what the whole photo shows: the main subjects, the setting, and what is "
+    "happening. Use exactly this format:\nVisible: <at most 40 words>\nScene: <at most 50 words>"
+)
+QUOTE_HIT_PROMPT = (
+    "A guess about a photo:\n\"{guess}\"\n\nFact: \"{fact}\"\n\nDoes the guess state this fact, or something that "
+    "clearly implies it? Synonyms and more specific wording count (\"a golden retriever\" implies \"a dog\"). The "
+    "guess must commit to it: alternatives such as \"a dog or a cat\" and hedges such as \"possibly\" or \"maybe\" "
+    "do not count. If yes, reply Yes, then copy the exact words of the guess that state it, in double quotes. "
+    "If no, reply No."
+)
+QUOTE_CHECK_PROMPT = (
+    "Text: \"{quote}\"\n\nFact: \"{fact}\"\n\nDoes the text on its own state this fact, or something that clearly "
+    "implies it? Answer Yes or No."
+)
+PHOTO_PROPERTY = re.compile(r"\b(lighting|lit|angle|eye level|composition|photo(graph)?|shot|focus|framed|"
+                            r"perspective|blurr?(ed|y)?|depth of field)\b", re.I)
+
+
+def norm_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def quote_in(quote: str, text: str) -> bool:
+    """The quoted words occur, in order and contiguous, in the text (case and punctuation ignored)."""
+    q, t = norm_words(quote), norm_words(text)
+    if not q:
+        return False
+    return any(t[i : i + len(q)] == q for i in range(len(t) - len(q) + 1))
+
+
+def parse_quote_hit(text: str) -> tuple[bool, str]:
+    t = strip_think(text).strip()
+    yes = t[:3].lower() == "yes"
+    m = re.findall(r"[\"“](.+?)[\"”]", t, flags=re.S)
+    return yes, (max(m, key=len).strip() if m else "")
+
+
+def text_generate_scored(model, tok, prompts: list[str], max_new_tokens: int, device: str,
+                         batch: int) -> list[tuple[str, float]]:
+    """Greedy answer plus p(Yes)/(p(Yes)+p(No)) at its first token, in one generate call."""
+    import torch
+
+    y, n = yes_no_ids(tok)
+    out = []
+    t0 = time.time()
+    for i in range(0, len(prompts), batch):
+        enc = tok([judge_text(tok, p) for p in prompts[i : i + batch]], return_tensors="pt", padding=True).to(device)
+        with torch.no_grad():
+            g = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tok.pad_token_id,
+                               output_scores=True, return_dict_in_generate=True)
+        p_yes = torch.softmax(g.scores[0].float()[:, [y, n]], -1)[:, 0].cpu().tolist()
+        texts = tok.batch_decode(g.sequences[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+        out += [(t, p if math.isfinite(p) else 0.5) for t, p in zip(texts, p_yes)]
+        if (i // batch) % 50 == 0:
+            print(f"  text_generate_scored {i + batch}/{len(prompts)} ({time.time() - t0:.0f}s)", flush=True)
+    return out
+
+
+def overlap(a: Box, b: Box) -> float:
+    """Intersection area as a share of the smaller box."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    return w * h / min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+
+
+def pick_crops(rng: random.Random, img: Image.Image, scale: float, k: int, cfg: L2GConfig, index=None,
+               name: str = "", max_overlap: float = 0.1) -> list[Box]:
+    """k crops of area `scale` that barely overlap: each is the most salient of its candidates (thing preferred)
+    among those overlapping earlier picks by at most max_overlap; relaxes the limit if none qualifies."""
+    from serverless.refgame import edge_energy
+
+    width, height = img.size
+    integral = np.pad(edge_energy(img).cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    picks: list[Box] = []
+    for _ in range(k):
+        best, best_key = None, None
+        for _ in range(cfg.crop_tries * 4):
+            w, h = box_size(rng, width, height, scale, cfg.min_side)
+            x0, y0, x1, y1 = b = random_box(rng, width, height, w, h)
+            ov = max((overlap(b, p) for p in picks), default=0.0)
+            energy = float(integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0])
+            share = thing_share(index, name, b)
+            key = (ov <= max_overlap, share is None or share >= cfg.min_thing_share, -ov, energy)
+            if best_key is None or key > best_key:
+                best, best_key = b, key
+        picks.append(best)
+    return picks
+
+
+def bootstrap_ci(xs: list[float], seed: int = 0, n: int = 10000) -> list[float]:
+    if not xs:
+        return [float("nan")] * 2
+    a = np.asarray(xs, dtype=float)
+    r = np.random.default_rng(seed)
+    means = a[r.integers(0, len(a), size=(n, len(a)))].mean(1)
+    return [float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))]
+
+
+def multicrop(args: argparse.Namespace) -> None:
+    """Phase 0d: k barely-overlapping crops of one image guess the whole photo together.
+
+    Reuses references and verified, weighted facts from a finished phase0 dir (--phase0-dir). Scores only on
+    facts that are [subject]/[scene], not photo properties, and visible in none of the k crops ("unseen" facts).
+    Two hit scores per (guess, fact): soft = judge p(Yes) (as in phase 0); strict = judge says Yes AND quotes words
+    that occur in the guess AND the judge, shown only that quote, agrees it states the fact.
+
+    Rows per image and scale: multi greedy + G sampled; single (crop 1 alone) greedy + G sampled; visible_concat
+    (the single-crop greedy Visible lines of all k crops, joined: the copy baseline); multi_visible (the multi
+    guess's own Visible line); other_multi (G guesses from k crops of another image: the blind baseline)."""
+    p0, out = Path(args.phase0_dir), Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    cfg = L2GConfig()
+    scales = tuple(float(s) for s in args.scales.split(","))
+    K, G = args.k, args.group
+    (out / "config.json").write_text(json.dumps({"args": vars(args)}, indent=1, default=str))
+    load = lambda path: [json.loads(l) for l in path.read_text().splitlines() if l.strip()]  # noqa: E731
+    refs = {r["image"]: r["reference"] for r in load(p0 / "references.jsonl")}
+    facts = {r["image"]: r["facts"] for r in load(p0 / "facts_weighted.jsonl")}
+    names = sorted(refs)[: args.n]
+    source = ImageSource(Path(args.images))
+    images = {n: source.load(source.index_of(n)) for n in names}
+    index = None
+    if args.index:
+        from serverless.hardneg import LabelIndex
+
+        index = LabelIndex.load(args.index)
+    other = {n: names[(i + 1 + len(names) // 2) % len(names)] for i, n in enumerate(names)}
+    boxes = {(n, s): pick_crops(random.Random(f"{args.seed}:l2gmulti:{n}:{s}"), images[n], s, K, cfg, index, n)
+             for n in names for s in scales}
+
+    def crop_img(name: str, box) -> Image.Image:
+        return resize_long(images[name].crop(tuple(box)), cfg.crop_side)
+
+    def multi_item(name: str, bxs) -> tuple[list[dict], list[Image.Image]]:
+        content = [{"type": "image"} for _ in bxs] + [{"type": "text", "text": MULTI_PROMPT.format(k=len(bxs))}]
+        return content, [crop_img(name, b) for b in bxs]
+
+    def single_item(name: str, box) -> tuple[list[dict], list[Image.Image]]:
+        return [{"type": "image"}, {"type": "text", "text": POLICY_PROMPT}], [crop_img(name, box)]
+
+    state: dict[str, Any] = {}
+
+    def vlm():
+        if "vlm" not in state:
+            state["vlm"] = load_vlm(args.model, args.vlm_device, args.loader)
+        return state["vlm"]
+
+    gkw = dict(device=args.vlm_device, batch=args.gen_batch)
+
+    # 1. guesses
+    def build_samples():
+        model, processor = vlm()
+        keys = [(n, s) for n in names for s in scales]
+        rows = []
+        multi = [multi_item(n, boxes[(n, s)]) for n, s in keys]
+        mg = generate(model, processor, multi, 1, args.max_new_tokens, 0.0, **gkw)
+        ms = generate(model, processor, multi, G, args.max_new_tokens, 1.0, **gkw)
+        singles = [single_item(n, b) for n, s in keys for b in boxes[(n, s)]]
+        sg = generate(model, processor, singles, 1, args.max_new_tokens, 0.0, **gkw)
+        ss = generate(model, processor, singles[::K], G, args.max_new_tokens, 1.0, **gkw)
+        om = generate(model, processor, [multi_item(other[n], boxes[(other[n], s)]) for n, s in keys], G,
+                      args.max_new_tokens, 1.0, **gkw)
+        for j, (n, s) in enumerate(keys):
+            base = {"image": n, "scale": s, "boxes": boxes[(n, s)]}
+            g = parse_guess(mg[j][0])
+            rows.append({**base, "kind": "multi_greedy", **g})
+            rows.append({**base, "kind": "multi_visible", "scene": g["visible"], "visible": g["visible"],
+                         "format_ok": True, "raw": ""})
+            rows += [{**base, "kind": "multi_sampled", "slot": t, **parse_guess(x)} for t, x in enumerate(ms[j])]
+            sgs = [parse_guess(sg[j * K + c][0]) for c in range(K)]
+            rows.append({**base, "kind": "single_greedy", **sgs[0]})
+            rows += [{**base, "kind": "single_sampled", "slot": t, **parse_guess(x)} for t, x in enumerate(ss[j])]
+            vc = " ".join(x["visible"] for x in sgs if x["visible"])
+            rows.append({**base, "kind": "visible_concat", "scene": vc, "visible": vc, "format_ok": True, "raw": ""})
+            rows += [{**base, "kind": "other_multi", "crop_of": other[n], "slot": t, **parse_guess(x)}
+                     for t, x in enumerate(om[j])]
+        return rows
+
+    samples = jsonl_cache(out / "samples.jsonl", build_samples)
+
+    # 2. which facts each crop shows (frozen VLM on the crop); unseen = shown by none of the k crops
+    def build_crop_facts():
+        model, processor = vlm()
+        items, keys = [], []
+        for n in names:
+            for s in scales:
+                for c, b in enumerate(boxes[(n, s)]):
+                    im = crop_img(n, b)
+                    for j, f in enumerate(facts[n]):
+                        items.append((VERIFY_PROMPT.format(fact=f["fact"]), im)); keys.append((n, s, c, j))
+        probs = vlm_yes_probs(model, processor, items, args.vlm_device, args.score_batch)
+        per: dict[tuple, list[list[float]]] = {}
+        for (n, s, c, j), p in zip(keys, probs):
+            per.setdefault((n, s), [[0.0] * len(facts[n]) for _ in range(K)])[c][j] = p
+        return [{"image": n, "scale": s, "in_crop_p": v} for (n, s), v in per.items()]
+
+    in_crop = {(r["image"], r["scale"]): r["in_crop_p"] for r in jsonl_cache(out / "crop_facts.jsonl",
+                                                                               build_crop_facts)}
+    if "vlm" in state:
+        del state["vlm"]
+        _free()
+
+    def eligible(f: dict) -> bool:
+        return f["type"] in ("subject", "scene") and not PHOTO_PROPERTY.search(f["fact"])
+
+    def unseen(n: str, s: float, upto: int = K) -> list[int]:
+        ps = in_crop[(n, s)][:upto]
+        return [j for j, f in enumerate(facts[n]) if eligible(f) and all(p[j] < cfg.verify_threshold for p in ps)]
+
+    # 3. judge: soft p(Yes) and strict quoted hit, on the facts unseen by all k crops
+    def build_hits():
+        judge, jtok = load_text_model(args.judge, args.judge_device)
+        pairs = []
+        for i, r in enumerate(samples):
+            for j in unseen(r["image"], r["scale"]):
+                pairs.append((i, j))
+        prompts = [QUOTE_HIT_PROMPT.format(guess=samples[i]["scene"] or "(empty)", fact=facts[samples[i]["image"]][j]
+                                           ["fact"]) for i, j in pairs]
+        res = text_generate_scored(judge, jtok, prompts, args.max_quote_tokens, args.judge_device,
+                                   args.judge_gen_batch)
+        parsed = [parse_quote_hit(t) for t, _ in res]
+        need = [k for k, ((i, _), (yes, q)) in enumerate(zip(pairs, parsed))
+                if yes and q and quote_in(q, samples[i]["scene"])]
+        check = text_yes_probs(judge, jtok, [QUOTE_CHECK_PROMPT.format(quote=parsed[k][1], fact=facts[
+            samples[pairs[k][0]]["image"]][pairs[k][1]]["fact"]) for k in need], args.judge_device, args.judge_batch)
+        check_of = dict(zip(need, check))
+        rows = []
+        for k, ((i, j), (text, p)) in enumerate(zip(pairs, res)):
+            yes, q = parsed[k]
+            rows.append({"row": i, "fact": j, "soft": p, "yes": yes, "quote": q,
+                         "quote_ok": k in check_of, "quote_check": check_of.get(k),
+                         "strict": float(k in check_of and check_of[k] >= 0.5), "raw": text})
+        del judge
+        _free()
+        return rows
+
+    hit_rows = jsonl_cache(out / "hits.jsonl", build_hits)
+    hit = {(h["row"], h["fact"]): h for h in hit_rows}
+
+    # 4. scores
+    def wrec(vals: list[float], ws: list[float]) -> float | None:
+        return float(np.dot(vals, ws) / sum(ws)) if ws and sum(ws) > 0 else None
+
+    scored = []
+    for i, r in enumerate(samples):
+        n = r["image"]
+        u = unseen(n, r["scale"])
+        ws = [facts[n][j]["weight"] for j in u]
+        row = {k: r[k] for k in ("image", "scale", "kind") if k in r} | {"slot": r.get("slot"), "n_unseen": len(u)}
+        for m in ("soft", "strict"):
+            row[f"uw_{m}"] = wrec([hit[(i, j)][m] for j in u], ws)
+            row[f"u_{m}"] = mean([hit[(i, j)][m] for j in u]) if u else None
+        row["words"] = n_words(r["scene"])
+        row["format_ok"] = r["format_ok"]
+        scored.append(row)
+    with open(out / "scores.jsonl", "w") as f:
+        for x in scored:
+            f.write(json.dumps(x) + "\n")
+
+    kinds = ("multi_greedy", "multi_sampled", "single_greedy", "single_sampled", "visible_concat", "multi_visible",
+             "other_multi")
+    summ: dict[str, Any] = {}
+    for s in scales:
+        part = [x for x in scored if x["scale"] == s and x["n_unseen"] > 0]
+        by = {k: [x for x in part if x["kind"] == k] for k in kinds}
+        per_img = lambda k, m: {img: mean(x[m] for x in by[k] if x["image"] == img)  # noqa: E731
+                                for img in {x["image"] for x in by[k]}}
+        d: dict[str, Any] = {"images": len({x["image"] for x in part}),
+                             "unseen_facts_per_image": mean(x["n_unseen"] for x in by["multi_greedy"]),
+                             "single_crop_unseen_per_image": mean(len(unseen(n, s, 1)) for n in names)}
+        for k in kinds:
+            d[k] = {m: mean(x[m] for x in by[k]) for m in ("uw_soft", "uw_strict", "u_soft", "u_strict", "words",
+                                                          "format_ok")} | {"n": len(by[k])}
+        for m in ("uw_soft", "uw_strict"):
+            for a, b in (("multi_greedy", "visible_concat"), ("multi_sampled", "visible_concat"),
+                         ("multi_sampled", "single_sampled"), ("multi_greedy", "single_greedy"),
+                         ("multi_sampled", "other_multi")):
+                pa, pb = per_img(a, m), per_img(b, m)
+                diffs = [pa[i] - pb[i] for i in pa if i in pb and not math.isnan(pa[i]) and not math.isnan(pb[i])]
+                d[f"gap_{a}-{b}_{m}"] = {"mean": mean(diffs), "ci95": bootstrap_ci(diffs, args.seed),
+                                         "share_above": mean(float(x > 0) for x in diffs), "n": len(diffs)}
+        groups: dict[str, list[float]] = {}
+        for x in by["multi_sampled"]:
+            groups.setdefault(x["image"], []).append(x["uw_strict"])
+        stds = [statistics.pstdev(v) for v in groups.values() if len(v) > 1 and None not in v]
+        d["multi_groups_with_signal_strict"] = mean(float(v > 0.05) for v in stds)
+        summ[f"scale_{s:g}"] = d
+    yes = [h for h in hit_rows if h["yes"]]
+    summ["judge"] = {"pairs": len(hit_rows), "yes": len(yes),
+                     "yes_with_valid_quote": mean(float(h["quote_ok"]) for h in yes),
+                     "strict_of_yes": mean(h["strict"] for h in yes),
+                     "soft_ge_half_but_not_strict": mean(float(h["soft"] >= 0.5 and not h["strict"]) for h in hit_rows)}
+    (out / "summary.json").write_text(json.dumps(summ, indent=1))
+    print(json.dumps(summ, indent=1), flush=True)
+
+    # 5. label sheet: strict hits of multi guesses that visible_concat did not get (what training would reward)
+    vc_row = {(r["image"], r["scale"]): i for i, r in enumerate(samples) if r["kind"] == "visible_concat"}
+    cand = []
+    for i, r in enumerate(samples):
+        if r["kind"] not in ("multi_greedy", "multi_sampled"):
+            continue
+        v = vc_row[(r["image"], r["scale"])]
+        for j in unseen(r["image"], r["scale"]):
+            h = hit[(i, j)]
+            if h["strict"] and not hit[(v, j)]["strict"]:
+                cand.append((r, j, h))
+    pick = random.Random(args.seed + 3).sample(cand, min(args.label_n, len(cand)))
+    with open(out / "label_sheet.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "image", "scale", "kind", "fact_type", "fact", "scene", "quote", "soft", "quote_check",
+                    "human_correct_yes_no", "notes"])
+        for k, (r, j, h) in enumerate(pick):
+            fct = facts[r["image"]][j]
+            w.writerow([k, r["image"], r["scale"], r["kind"], fct["type"], fct["fact"], r["scene"], h["quote"],
+                        f"{h['soft']:.3f}", f"{h['quote_check']:.3f}", "", ""])
+    print("wrote", out / "summary.json", "and", out / "label_sheet.csv", f"({len(pick)} of {len(cand)} rows)")
+
+
 def _free() -> None:
     import gc
 
@@ -947,11 +1271,35 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--loader", default="hf", choices=["hf", "unsloth"])
     r.add_argument("--vlm-device", default="cuda:0")
     r.add_argument("--score-batch", type=int, default=16)
+    m = sub.add_parser("multicrop", help="phase 0d: k crops guess the whole photo together")
+    m.add_argument("--images", required=True)
+    m.add_argument("--index", default="")
+    m.add_argument("--phase0-dir", required=True, help="a finished phase0 out dir (references, weighted facts)")
+    m.add_argument("--out-dir", required=True)
+    m.add_argument("--model", default="unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-4bit")
+    m.add_argument("--loader", default="hf", choices=["hf", "unsloth"])
+    m.add_argument("--judge", default="Qwen/Qwen3-4B-Instruct-2507")
+    m.add_argument("--vlm-device", default="cuda:0")
+    m.add_argument("--judge-device", default="cuda:0")
+    m.add_argument("--n", type=int, default=200)
+    m.add_argument("--k", type=int, default=3, help="crops per guess")
+    m.add_argument("--scales", default="0.1,0.2", help="area of EACH crop")
+    m.add_argument("--group", type=int, default=8)
+    m.add_argument("--max-new-tokens", type=int, default=200)
+    m.add_argument("--max-quote-tokens", type=int, default=48)
+    m.add_argument("--gen-batch", type=int, default=16)
+    m.add_argument("--score-batch", type=int, default=16)
+    m.add_argument("--judge-batch", type=int, default=16)
+    m.add_argument("--judge-gen-batch", type=int, default=16)
+    m.add_argument("--label-n", type=int, default=150)
+    m.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     if args.cmd == "phase0":
         phase0(args)
     elif args.cmd == "outcrop":
         rescore_outcrop(args)
+    elif args.cmd == "multicrop":
+        multicrop(args)
 
 
 if __name__ == "__main__":
