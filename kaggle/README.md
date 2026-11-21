@@ -50,3 +50,19 @@ recall or content term, so a longer or invented description cannot pay. `refgame
 colour/sharpness-matched regions of other images; `refgame-oracle`: COCO-label-matched regions. The step-0 eval
 also reports blind (no description) and colour-only listener floors. Base-model checks without training:
 `python -m serverless.refgame phase0 --images <val2017> --out-dir <dir> --scheme name='{...}'`.
+
+## Script arms (no training): `script_kaggle.ipynb`
+
+Phase-0 checks that need a GPU but no training run through a second notebook that clones the repo, finds COCO
+val2017 (building the label index when an argument asks for `{INDEX:val2017}`), runs one `python -m serverless.<module>`
+command, and keeps its log and outputs in `out/<ARM>/`:
+
+```bash
+NOTEBOOK=script_kaggle.ipynb ./kaggle/run.sh <kaggle_user> l2g-phase0-smoke   # 4 images, pipeline check
+NOTEBOOK=script_kaggle.ipynb ./kaggle/run.sh <kaggle_user> l2g-phase0         # local-to-global phase 0, 200 images
+NOTEBOOK=script_kaggle.ipynb ./kaggle/run.sh <kaggle_user> l2g-phase0 'EXTRA_ARGS=["--n","100"]'
+```
+
+`l2g-phase0` (`serverless/l2g.py`): the frozen Qwen3-VL-8B (4-bit, cuda:0) writes one open-ended reference caption
+per image and guesses the whole image from 10/20/30% crops; a Qwen3-4B text judge, bge-base and SigLIP (cuda:1)
+score the guesses. Expect roughly 4-6 h on T4 x2 for 200 images.
